@@ -4,6 +4,11 @@ IMAGE   ?= ghcr.io/example/$(BINARY)
 TAG     ?= $(VERSION)
 GOFLAGS ?= -trimpath
 LDFLAGS ?= -s -w -X main.version=$(VERSION)
+# CONTAINER_TOOL defines the container tool to be used for building images.
+# Be aware that the target commands are only tested with Docker which is
+# scaffolded by default. However, you might want to replace it to use other
+# tools. (i.e. podman)
+CONTAINER_TOOL ?= podman
 
 .PHONY: all
 all: check build
@@ -27,9 +32,14 @@ vet:
 test:
 	go test -race -cover ./...
 
-.PHONY: image
-image:
-	docker build --build-arg VERSION=$(VERSION) -t $(IMAGE):$(TAG) .
+
+.PHONY: image-build
+image-build:
+	$(CONTAINER_TOOL) build --build-arg VERSION=$(VERSION) -t $(IMAGE):$(TAG) --platform linux/amd64 .
+
+.PHONY: image-push
+image-push: ## Push container image.
+	$(CONTAINER_TOOL) push ${IMG}
 
 .PHONY: deploy
 deploy:
