@@ -128,8 +128,9 @@ and invalidates the partition, and the plugin has to put it back.
 ## Build and deploy
 
 ```sh
-make check build          # gofmt, vet, race tests, static binary in bin/
-make image IMAGE=...      # container image
+make check build                         # gofmt, vet, race tests, static binary in bin/
+make image-push IMAGE=...               # container image
+make image-build IMAGE=...                # container image
 kubectl apply -f deploy/daemonset.yaml
 ```
 
@@ -155,7 +156,7 @@ cat /sys/fs/cgroup/kubepods.slice/cpuset.cpus.effective
 
 # Load balancing is off for an isolated partition: threads of a container
 # that does not pin them stay on the core they started on.
-ps -eL -o pid,lwp,psr,cgroup,comm | grep <container-id>
+ps -eL -o pid,ppid,lwp,nlwp,psr,cgroup,comm | grep <container-id>
 ```
 
 ## Operational hazards
