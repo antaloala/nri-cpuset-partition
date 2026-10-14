@@ -1,0 +1,75 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nri-cpuset-partition
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nri-cpuset-partition
+  namespace: nri-cpuset-partition
+  labels:
+    app.kubernetes.io/name: nri-cpuset-partition
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nri-cpuset-partition
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nri-cpuset-partition
+    spec:
+      # The plugin is part of the node's cpu management; it must be scheduled
+      # before the workloads whose partitions it creates, and never evicted.
+      priorityClassName: system-node-critical
+      hostNetwork: false
+      # Restrict the rollout to the nodes where the cpu isolation is actually
+      # configured; label them first, or drop the selector to run everywhere.
+      # nodeSelector:
+      #   cpu-isolation: "true"
+      tolerations:
+        - operator: Exists
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: plugin
+          image: ghcr.io/example/nri-cpuset-partition:latest   # EDIT
+          imagePullPolicy: IfNotPresent
+          args:
+            - --plugin-name=cpuset-partition
+            # Index decides the plugin ordering; leave room below for plugins
+            # that have to adjust resources before this one reads them.
+            - --plugin-index=50
+            - --resync-period=10s
+            - --log-level=info
+            # Start here on a new node: logs every cgroup write without
+            # performing any of them.
+            # - --dry-run
+          securityContext:
+            # Writing cpuset.cpus.exclusive and cpuset.cpus.partition on the
+            # host cgroup tree needs full privileges; dropping to
+            # CAP_DAC_OVERRIDE alone is not enough with SELinux enforcing.
+            privileged: true
+            runAsUser: 0
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: nri-socket
+              mountPath: /var/run/nri
+            - name: cgroupfs
+              mountPath: /sys/fs/cgroup
+      volumes:
+        - name: nri-socket
+          hostPath:
+            path: /var/run/nri
+            type: Directory
+        - name: cgroupfs
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory

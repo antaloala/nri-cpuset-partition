@@ -1,0 +1,59 @@
+# Two shapes of the annotation, on a pod that the static CPU Manager policy
+# gives exclusive cores to: Guaranteed QoS (requests == limits for every
+# resource of every container) and an integer amount of cpu.
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: isolated-workload
+  annotations:
+    # Every container of this pod that gets exclusive cores becomes an
+    # isolated partition.
+    cpuset-cpus-partition.nri.io/pod: "isolated"
+spec:
+  runtimeClassName: ""   # EDIT or drop
+  containers:
+    - name: worker
+      image: registry.suse.com/bci/bci-base:latest
+      command: ["sleep", "infinity"]
+      resources:
+        requests:
+          cpu: "4"
+          memory: 1Gi
+        limits:
+          cpu: "4"
+          memory: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mixed-workload
+  annotations:
+    # The pod-wide default...
+    cpuset-cpus-partition.nri.io/pod: "isolated"
+    # ...overridden per container: a dedicated scheduling domain that keeps
+    # load balancing, for a multi-threaded container that does not pin its
+    # own threads.
+    cpuset-cpus-partition.nri.io/container.helper: "root"
+    # ...and one container left alone entirely.
+    cpuset-cpus-partition.nri.io/container.sidecar: "member"
+spec:
+  containers:
+    - name: pmd
+      image: registry.suse.com/bci/bci-base:latest
+      command: ["sleep", "infinity"]
+      resources:
+        requests: {cpu: "2", memory: 1Gi}
+        limits: {cpu: "2", memory: 1Gi}
+    - name: helper
+      image: registry.suse.com/bci/bci-base:latest
+      command: ["sleep", "infinity"]
+      resources:
+        requests: {cpu: "2", memory: 512Mi}
+        limits: {cpu: "2", memory: 512Mi}
+    - name: sidecar
+      image: registry.suse.com/bci/bci-base:latest
+      command: ["sleep", "infinity"]
+      resources:
+        requests: {cpu: "1", memory: 256Mi}
+        limits: {cpu: "1", memory: 256Mi}
