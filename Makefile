@@ -15,7 +15,7 @@ all: check build
 
 .PHONY: build
 build:
-	CGO_ENABLED=0 go build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o bin/$(BINARY) ./cmd/$(BINARY)
+	CGO_ENABLED=0 go build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o bin/$(BINARY) ./cmd/
 
 .PHONY: check
 check: fmt vet test
