@@ -1,6 +1,6 @@
 module github.com/antaloala/nri-cpuset-partition
 
-go 1.27.2
+go 1.26.0
 
 require github.com/containerd/nri v0.12.3
 
