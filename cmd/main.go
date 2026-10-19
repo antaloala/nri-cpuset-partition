@@ -60,7 +60,7 @@ func run() error {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Println(version)
+		fmt.Println(Version)
 		return nil
 	}
 
