@@ -82,7 +82,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	log.Info("starting", "version", version, "cgroupRoot", cg.Root(), "dryRun", *dryRun)
+	log.Info("starting", "version", Version, "cgroupRoot", cg.Root(), "dryRun", *dryRun)
 
 	cfg := partition.Config{
 		KubepodsCgroup: *kubepods,
