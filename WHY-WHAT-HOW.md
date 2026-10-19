@@ -1,6 +1,6 @@
-# WHAT's the issue? ---  WHY do we need this NRI `cpuset.cpus.partition` plugin --- HOW is it to work?
+# WHAT's the issue? / WHY do we need this NRI plugin? / HOW is it expected to work?
 
-## A. Assumptions
+## [A]. Assumptions
 
 - **RKE2 >= v1.35.4+rke2r1** (see the [release notes](https://github.com/rancher/rke2/releases/tag/v1.35.4%2Brke2r1)), which implies:
   - containerd >= v2.2.3
@@ -8,7 +8,7 @@
 - **Operating system**: SUSE Linux Micro 6.2 RT (`6.12.0-160000.38-rt`) or a newer `PREEMPT_RT` kernel.
 - **Go** >= 1.26.0
 
-## B. Problem description
+## [B]. Problem description
 
 ### B.1 Housekeeping cores are needed for network interrupts
 
@@ -16,12 +16,12 @@ We need a non-negligible number of Housekeeping (HK) cores to handle network-rel
 
 > **IMPORTANT:** this does **not** apply to DPDK workloads, as these workloads poll the NIC RX queues
 > directly and therefore avoid IRQ handling.
-> The number of HK cores required from DPDK-based workloads is then much lower than what is required from non-DPDK based networking workloads
+> The number of HK cores required from DPDK-based workloads is then much lower than what is required from non-DPDK networking workloads
 
 - When using RSS to distribute/load balance the IRQ/MSI-X vectors (each RX queue has its own
   MSI-X vector), several HK cores are needed to manage those IRQs/MSI-Xs.
-- ...but having many network-intensive workloads also requires enough, properly isolated, cores to
-  exclusively assign to those workloads ...
+- ... but having many network-intensive workloads to run also requires enough, properly isolated,
+cores to exclusively assign to those workloads ...
 
 ### B.2 The `static` CPU Manager policy
 
@@ -31,44 +31,47 @@ assigned cores. The two conditions required by the `static` policy are:
 1. The task is triggered from a container defined in the scope of a **Guaranteed** QoS pod.
 2. That container requests an **integer** amount of CPU.
 
-> **IMPORTANT:** this **also** applies to DPDK workloads.
+> **IMPORTANT:** all this **also** applies to DPDK workloads.
 
 - The `static` policy removes the `reservedSystemCPUs` cores (set in the kubelet config) from
-  being exclusively assigned to containers fulfilling the two conditions above.
+  being exclusively assigned to containers that meet the two aforementioned conditions.
 - The `static` policy does **not** remove the `reservedSystemCPUs` cores from the *shared pool*,
   so those cores can still run tasks triggered from pods' containers that do not fulfil
   (1) **and** (2) above.
-- Ensuring that OS daemons and Kubernetes daemons are restricted to the cores set in
-  `reservedSystemCPUs` is not handled by Kubernetes — it is done outside Kubernetes.
+- Ensuring that operating system daemons and Kubernetes daemons are restricted to the cores
+defined in `reservedSystemCPUs` is not something that Kubernetes manages; it is handled
+outside of Kubernetes.
 
 ### B.3 `strict-cpu-reservation`
 
-We intend to also enable `strict-cpu-reservation`, to ensure the cores reserved for OS and
-Kubernetes daemons are not used to run any pod workload.
+We also plan to enable `strict-cpu-reservation` CPU Manager Policy option to ensure that
+the cores reserved for the operating system and Kubernetes daemons are not used to run
+any pod workloads.
 
-> **IMPORTANT:** this **also** applies to DPDK workloads.
+> **IMPORTANT:** all this **also** applies to DPDK workloads.
 
 - As said above, the `static` policy does **not** remove the `reservedSystemCPUs` cores from the
   shared pool; `strict-cpu-reservation` does, resulting in all pods' containers' cgroups having
   those cores removed from their `cpuset.cpus` (except for the pod sandbox — `pause` — container,
-  which is not stealing CPU cycles anyway).
-- Most tasks triggered from pods' containers do not invoke (directly or indirectly) the
-  `sched_setaffinity()` syscall. We therefore **should not** set the `domain` flag in the
+  which does not consume CPU cycles anyway).
+- A most tasks triggered from pods' containers do not invoke (directly or indirectly) the
+  `sched_setaffinity()` syscall: we therefore **should not** set the `domain` flag in the
   `isolcpus` kernel argument when also enabling the `strict-cpu-reservation`
   `cpuManagerPolicyOption` on the kubelet side: doing so would restrict all tasks triggered from
-  non self-pinning-capable workloads to the first isolated core, overloading it (as already
-  experienced in the test runs).
+  non self-pinning-capable workloads to the first isolated core, overloading that core (as already
+  experienced in several test).
 - Removing an isolated core from the SMP balancing and scheduling algorithm should be done
-  dynamically, and only for those isolated cores exclusively assigned to pods' containers by the
-  `static` policy of the kubelet CPU Manager. This is done with:
+  (a) dynamically, (b) only for those cores exclusively assigned to pods' containers by the
+  `static` policy of the kubelet CPU Manager and (c) when explictly requested for a given pod's
+  container. This is done with:
 
   ```sh
   echo isolated > cpuset.cpus.partition
   ```
 
-  on the pod's container cgroup (i.e. using the cgroup v2 cpuset partition support). It also
-  requires previously updating the ancestors' cgroups' `cpuset.cpus.exclusive` value — i.e. in
-  `/sys/fs/cgroup/kubepods.slice` and
+  on the pod's container cgroup (i.e., using the cgroup v2 cpuset ["remote partition"](https://docs.kernel.org/admin-guide/cgroup-v2.html#:~:text=partition%20is%20created.-,cpuset.cpus.partition,-A%20read%2Dwrite)
+  support). It also requires previously updating the ancestors' cgroups' `cpuset.cpus.exclusive` value
+  — updating it first in `/sys/fs/cgroup/kubepods.slice` and, after that, in
   `/sys/fs/cgroup/kubepods.slice/kubepods-pod<uid>.slice` — to include the cores exclusively
   assigned to that pod's container.
 
@@ -78,18 +81,18 @@ Kubernetes daemons are not used to run any pod workload.
   isolated invalid (Invalid cpu list in cpuset.cpus.exclusive)
   ```
 
-  This error happens because the range of the container cgroup's `cpuset.cpus.exclusive` cores (that
+  This error happens because the container cgroup's `cpuset.cpus.exclusive` cores (that
   is, the range implicitly covered by `cpuset.cpus` when `cpuset.cpus.exclusive` is left empty)
   is not equal to, nor a subset of, the ancestor cgroup's `cpuset.cpus.exclusive.effective`.
 
-## C. Proposed solution
+## [C]. Proposed solution
 
 An NRI plugin with the behaviour described below.
 
 ### C.1 Applying the partition setting
 
-- The plugin applies `echo isolated > cpuset.cpus.partition` on a container's cgroup — together
-  with the previously required updates to the ancestors' cgroups' `cpuset.cpus.exclusive`, adding
+- The plugin applies `echo isolated > cpuset.cpus.partition` on a container's cgroup AFTER
+  having updated the ancestors' cgroups' `cpuset.cpus.exclusive`: adding
   the cores exclusively assigned to that container — for those pods' containers that are
   exclusively assigned a set of cores by the kubelet `static` CPU Manager policy.
 - It must also remove those exclusively assigned cores from the ancestors'
@@ -101,7 +104,7 @@ An NRI plugin with the behaviour described below.
 
 ### C.2 Annotations
 
-The plugin acts only when the involved pod carries a (new) annotation asking for it. The
+The plugin acts only when the involved pod carries a (new defined) annotation asking for it. The
 possibilities for this new `cpuset-cpus-partition.nri.io` annotation are:
 
 ```yaml
@@ -112,10 +115,10 @@ cpuset-cpus-partition.nri.io/pod: <annotation_value>
 
 # container-level annotation [optional]:
 #   Applies the indicated value to the container with the given name.
-#   Other containers in this pod that ask for an integer amount of CPU but are
-#   missing "their" annotation get the value set by the pod-level annotation,
-#   falling back to the default "member" value if the pod-level annotation is
-#   missing ("member" value means nothing is to be done by the NRI plugin).
+#   Other containers in this pod that request an integer amount of CPU, but lack
+#   their own specific annotation, adopt the value set via the pod-level annotation;
+#   if the latter is also absent, the system falls back to the default "member"
+#   value (the "member" value indicates that the NRI plugin should take no action).
 cpuset-cpus-partition.nri.io/container.<container_name>: <annotation_value>
 ```
 
@@ -125,8 +128,8 @@ cpuset-cpus-partition.nri.io/container.<container_name>: <annotation_value>
 - **NOTE (2):** if both the pod and the container annotation forms are present in a Guaranteed QoS
   pod, the container annotation value takes precedence for the indicated container. The pod
   annotation value is still used for all the other containers in that pod that ask for an integer
-  amount of CPU (and so are exclusively assigned a set of cores by the CPU Manager) but are
-  missing "their" `cpuset-cpus-partition.nri.io/container.<container_name>` annotation.
+  amount of CPU (and so are exclusively assigned a set of cores by the CPU Manager "static" policy)
+  but are missing "their" `cpuset-cpus-partition.nri.io/container.<container_name>` annotation.
 
 Supported annotation values (see <https://kernel-internals.org/sched/cpuset/>):
 

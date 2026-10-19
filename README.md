@@ -1,8 +1,8 @@
 # nri-cpuset-partition
 
 An NRI plugin that turns the cgroup of a container holding exclusively
-assigned cpus into a **cgroup v2 cpuset partition**, handing the exclusive cpu
-reservation down from `kubepods.slice` on the way.
+assigned cpus into a **cgroup v2 cpuset remote partition**, handing the
+exclusive cpu reservation down from `kubepods.slice` on the way.
 
 It implements section `[C] PROPOSED SOLUTION` of `./WHAT-WHY-HOW.md`.
 
@@ -11,9 +11,10 @@ It implements section `[C] PROPOSED SOLUTION` of `./WHAT-WHY-HOW.md`.
 Kubelet's CPU Manager `static` policy pins a Guaranteed QoS pod's container that asks
 for an integer amount of cpu to a fixed set of cores, but those cores stay in
 the kernel's SMP load balancing domain if not having been removed from it
-(e.g., at kernel bootup, when adding the "domain" flag to the "isolcpus" kernel parameter).
+(e.g., at kernel bootup, adding the "domain" flag to the "isolcpus" kernel parameter).
 It is still possible to dynamically remove those cpu cores from the kernel's SMP load
-balancing using the cpuset partition support provided from cgroups v2 cpuset controller.
+balancing using the cpuset remote partition support provided from cgroups v2 cpuset controller
+(available from kernel 6.7 onward)
 
 ```sh
 echo isolated > /sys/fs/cgroup/kubepods.slice/kubepods-pod<uid>.slice/cri-containerd-<id>.scope/cpuset.cpus.partition
@@ -22,6 +23,7 @@ echo isolated > /sys/fs/cgroup/kubepods.slice/kubepods-pod<uid>.slice/cri-contai
 which the kernel rejects out of the box:
 
 ```
+cat /sys/fs/cgroup/kubepods.slice/kubepods-pod<uid>.slice/cri-containerd-<id>.scope/cpuset.cpus.partition
 isolated invalid (Invalid cpu list in cpuset.cpus.exclusive)
 ```
 
@@ -29,7 +31,9 @@ Why is it rejected? A leaf cgroup v2 can only become a partition root over cpus
 that **every one of its ancestors already lists in its cgroup's `cpuset.cpus.exclusive`**
 (the "remote partition" support of kernel 6.7+). Kubelet leaves that file empty everywhere,
 so the reservation has to be threaded down in the kubelet cgroups v2 hierarchy: `kubepods.slice` →
-`kubepods-pod<uid>.slice` → the container scope first.
+`kubepods-pod<uid>.slice` (not needed in the container .scope).
+NOTE: `cpuset.cpus.exclusive` must be FIRST updated at the top of the ancestors hierarchy
+(i.e., at `kubepods.slice`)
 
 Cgroups v2 cpuset controller accepts only the following input values in `cpuset.cpus.partition`:
 
@@ -69,9 +73,9 @@ metadata:
 - The per-container form wins over the pod-wide one for that container; the
   other containers keep the pod-wide value.
 - The annotation is **ignored** unless the CPU Manager actually gave the
-  container exclusive cores, i.e. the pod is Guaranteed QoS *and* the container
-  asks for a whole number of cpus. The plugin checks this three ways: the pod's
-  cgroup sits directly under `kubepods.slice` (how kubelet lays out Guaranteed
+  container exclusive cores, i.e. (1) the pod is Guaranteed QoS *and* (2) the 
+  container asks for a whole number of cpus. The plugin checks this three ways: the
+  pod's cgroup sits directly under `kubepods.slice` (how kubelet lays out Guaranteed
   pods), the cfs quota is a whole multiple of the period, and the container's
   `cpuset.cpus` holds exactly that many cores.
 
@@ -129,8 +133,8 @@ and invalidates the partition, and the plugin has to put it back.
 
 ```sh
 make check build                         # gofmt, vet, race tests, static binary in bin/
-make image-push IMAGE=...               # container image
-make image-build IMAGE=...                # container image
+make image-push IMAGE=...                # container image
+make image-build IMAGE=...               # container image
 kubectl apply -f deploy/daemonset.yaml
 ```
 
@@ -190,7 +194,7 @@ ps -eL -o pid,ppid,lwp,nlwp,psr,cgroup,comm | grep <container-id>
 ## Layout
 
 ```
-cmd/nri-cpuset-partition/   entry point, flags, reconnect loop
+cmd/                        entry point, flags, reconnect loop
 internal/cpuset/            cpu list parsing and set algebra
 internal/cgroup/            cgroup v2 paths and cpuset file access
 internal/partition/         NRI callbacks, state tracking, reconciliation
