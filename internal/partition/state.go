@@ -119,17 +119,29 @@ func partitionMode(pod *api.PodSandbox, ctr *api.Container) (mode, source string
 	return cgroup.PartitionMember, ""
 }
 
-// requestedCPUs recovers the integer number of cpus a container asked for from
-// its cfs quota. It reports false when the quota is not set (cpuCFSQuota
-// disabled, or a container without a cpu limit) or is not a whole number of
-// cpus, in which case the CPU Manager did not assign it exclusive cores.
+// requestedCPUs recovers the integer number of cpus a container asked for. It
+// reports false when the request is not a whole number of cpus, in which case
+// the CPU Manager did not assign it exclusive cores.
+//
+// The cfs quota is used when set. Since Kubernetes 1.33 the kubelet
+// (DisableCPUQuotaWithExclusiveCPUs, on by default) leaves containers with
+// exclusive cpus unthrottled, quota -1, so the cpu shares are the fallback:
+// the kubelet derives them as milliCPU*1024/1000 from the request, which in a
+// Guaranteed pod equals the limit, and they are a multiple of 1024 exactly
+// when the request is a whole number of cpus.
 func requestedCPUs(ctr *api.Container) (int, bool) {
 	cpu := ctr.GetLinux().GetResources().GetCpu()
 	quota, period := cpu.GetQuota().GetValue(), int64(cpu.GetPeriod().GetValue())
-	if quota <= 0 || period <= 0 || quota%period != 0 {
-		return 0, false
+	if quota > 0 && period > 0 {
+		if quota%period != 0 {
+			return 0, false
+		}
+		return int(quota / period), true
 	}
-	return int(quota / period), true
+	if shares := cpu.GetShares().GetValue(); shares > 0 && shares%1024 == 0 {
+		return int(shares / 1024), true
+	}
+	return 0, false
 }
 
 // evaluate decides whether a container must be turned into a cpuset partition

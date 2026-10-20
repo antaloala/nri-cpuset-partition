@@ -92,6 +92,7 @@ func (f *fakeTree) addContainer(podUID, podName, ctrName, ctrID, cpus string, an
 			Resources: &api.LinuxResources{
 				Cpu: &api.LinuxCPU{
 					Cpus:   cpus,
+					Shares: api.UInt64(uint64(cpuCount(cpus)) * 1024),
 					Quota:  api.Int64(int64(cpuCount(cpus)) * 100000),
 					Period: api.UInt64(uint64(100000)),
 				},
@@ -252,6 +253,7 @@ func TestOutOfScopeContainersAreIgnored(t *testing.T) {
 		qos         string
 		cpus        string
 		quota       int64
+		shares      uint64
 	}{
 		{name: "not annotated", annotations: nil, qos: "Guaranteed"},
 		{name: "member", annotations: map[string]string{AnnotationPod: "member"}, qos: "Guaranteed"},
@@ -261,6 +263,9 @@ func TestOutOfScopeContainersAreIgnored(t *testing.T) {
 		// 1.5 cpus is not an integer request, so the CPU Manager gave it no
 		// exclusive cores.
 		{name: "fractional cpu", annotations: ann, qos: "Guaranteed", quota: 150000},
+		// The same 1.5 cpus with the quota dropped by the kubelet: only the
+		// shares are left, and 1536 is not a whole number of cpus either.
+		{name: "fractional cpu without quota", annotations: ann, qos: "Guaranteed", quota: -1, shares: 1536},
 		// One cpu requested but the whole isolated range in the cpuset: a
 		// shared pool container, nothing exclusive to carve out.
 		{name: "shared pool", annotations: ann, qos: "Guaranteed", cpus: "20-39", quota: 100000},
@@ -277,6 +282,9 @@ func TestOutOfScopeContainersAreIgnored(t *testing.T) {
 			if tc.quota != 0 {
 				ctr.Linux.Resources.Cpu.Quota = api.Int64(tc.quota)
 			}
+			if tc.shares != 0 {
+				ctr.Linux.Resources.Cpu.Shares = api.UInt64(tc.shares)
+			}
 
 			if err := p.PostCreateContainer(context.Background(), pod, ctr); err != nil {
 				t.Fatal(err)
@@ -288,6 +296,26 @@ func TestOutOfScopeContainersAreIgnored(t *testing.T) {
 				t.Errorf("%d partitions applied, want 0", got)
 			}
 		})
+	}
+}
+
+// Since Kubernetes 1.33 the kubelet sends no cfs quota for containers with
+// exclusive cpus (DisableCPUQuotaWithExclusiveCPUs); the request must then be
+// recovered from the cpu shares.
+func TestExclusiveContainerWithoutQuotaIsPartitioned(t *testing.T) {
+	f := newFakeTree(t)
+	p := f.newPlugin(t)
+
+	ann := map[string]string{AnnotationPod: "isolated"}
+	pod, ctr := f.addContainer("A", "pod", "app", "aaa", "20-25", ann, "Guaranteed")
+	ctr.Linux.Resources.Cpu.Quota = api.Int64(-1)
+	mustCreate(t, p, pod, ctr)
+
+	if got := f.read(t, ctrScopeRel("A", "aaa"), cgroup.FilePartition); got != "isolated" {
+		t.Errorf("partition = %q, want isolated", got)
+	}
+	if got := f.read(t, kubepods, cgroup.FileExclusive); got != "20-25" {
+		t.Errorf("kubepods.slice exclusive = %q, want 20-25", got)
 	}
 }
 
