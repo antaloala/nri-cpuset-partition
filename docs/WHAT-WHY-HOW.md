@@ -104,14 +104,14 @@ An NRI plugin with the behaviour described below.
 
 ### C.2 Annotations
 
-The plugin acts only when the involved pod carries a (new defined) annotation asking for it. The
-possibilities for this new `cpuset-cpus-partition.nri.io` annotation are:
+The plugin acts only when the involved pod carries a new Pod annotation asking for it. The
+possibilities for this new `cpuset-partition.nri.io` annotation are:
 
 ```yaml
 # pod-level annotation [optional]:
 #   Applies the indicated value to all the containers in this Guaranteed QoS pod
 #   that ask for an integer amount of CPU.
-cpuset-cpus-partition.nri.io/pod: <annotation_value>
+cpuset-partition.nri.io/pod: <annotation_value>
 
 # container-level annotation [optional]:
 #   Applies the indicated value to the container with the given name.
@@ -119,7 +119,7 @@ cpuset-cpus-partition.nri.io/pod: <annotation_value>
 #   their own specific annotation, adopt the value set via the pod-level annotation;
 #   if the latter is also absent, the system falls back to the default "member"
 #   value (the "member" value indicates that the NRI plugin should take no action).
-cpuset-cpus-partition.nri.io/container.<container_name>: <annotation_value>
+cpuset-partition.nri.io/container.<container_name>: <annotation_value>
 ```
 
 - **NOTE (1):** if this annotation is set on a pod that is not Guaranteed QoS, or refers to a
@@ -129,7 +129,7 @@ cpuset-cpus-partition.nri.io/container.<container_name>: <annotation_value>
   pod, the container annotation value takes precedence for the indicated container. The pod
   annotation value is still used for all the other containers in that pod that ask for an integer
   amount of CPU (and so are exclusively assigned a set of cores by the CPU Manager "static" policy)
-  but are missing "their" `cpuset-cpus-partition.nri.io/container.<container_name>` annotation.
+  but are missing "their" `cpuset-partition.nri.io/container.<container_name>` annotation.
 
 Supported annotation values (see <https://kernel-internals.org/sched/cpuset/>):
 

@@ -14,10 +14,10 @@ import (
 // The annotation this plugin reacts to, in its pod-wide and per-container
 // forms, e.g.
 //
-//	cpuset-cpus-partition.nri.io/pod: isolated
-//	cpuset-cpus-partition.nri.io/container.dpdk-app: isolated
+//	cpuset-partition.nri.io/pod: isolated
+//	cpuset-partition.nri.io/container.dpdk-app: isolated
 const (
-	AnnotationDomain    = "cpuset-cpus-partition.nri.io"
+	AnnotationDomain    = "cpuset-partition.nri.io"
 	AnnotationPod       = AnnotationDomain + "/pod"
 	AnnotationCtrPrefix = AnnotationDomain + "/container."
 	qosClassGuaranteed  = "Guaranteed"

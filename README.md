@@ -4,7 +4,7 @@ An NRI plugin that turns the cgroup of a container holding exclusively
 assigned cpus into a **cgroup v2 cpuset remote partition**, handing the
 exclusive cpu reservation down from `kubepods.slice` on the way.
 
-It implements section `[C] PROPOSED SOLUTION` of `./WHAT-WHY-HOW.md`.
+It implements section `[C] PROPOSED SOLUTION` of `./docs/WHAT-WHY-HOW.md`.
 
 ## Why it is needed
 
@@ -64,8 +64,8 @@ and why `root` value exists as the middle ground.
 ```yaml
 metadata:
   annotations:
-    cpuset-cpus-partition.nri.io/pod: isolated
-    cpuset-cpus-partition.nri.io/container.<container_name>: root
+    cpuset-partition.nri.io/pod: isolated                        # pod-wide annotation
+    cpuset-partition.nri.io/container.<container_name>: root     # container-scoped annotation
 ```
 
 - Values: `member` (default, nothing happens), `root`, `isolated`. Anything
@@ -91,14 +91,14 @@ writes it out, in this order:
 2. **reserve** on the ancestors, parents before children — a child can only be
    granted cpus its parent already holds. Each ancestor's
    `cpuset.cpus.exclusive` is written as the *union over every live
-   reservation*, never as a read-modify-write of the current file;
+   child reservation*, never as a read-modify-write of the current file;
 3. **create** the partitions at the leaves and verify the kernel accepted
    them.
 
 Everything runs under a single mutex, which is what makes concurrent container
 events safe: two pods starting at once cannot have one's write to
-`kubepods.slice/cpuset.cpus.exclusive` drop the other's cores, because each
-recomputes the full union rather than editing what it read.
+`<cgoups2-mount-path>/kubepods.slice/cpuset.cpus.exclusive` drop the other's  
+cores, because each recomputes the full union rather than editing what it read.
 
 ### Lifecycle
 
@@ -116,9 +116,10 @@ recomputes the full union rather than editing what it read.
 A container that stops while siblings in the same pod are still running has
 its partition demoted immediately, but its cores stay reserved on the
 ancestors until the whole pod is gone. That is the `[C]` requirement that the
-ancestors are only updated "when ALL the pod's containers have terminated".
+ancestors are only updated "when ALL the pod's containers have terminated"
+(mimicking the way cpu-manager returns cores to the shared pool).
 
-The exact instant at which the CPU Manager returns cores to the shared pool is
+The exact instant at which the cpu-manager returns cores to the shared pool is
 not observable from NRI, so the plugin releases on the last `StopContainer`
 instead. Releasing marginally early is the safe direction: the CPU Manager
 still holds the assignment at that point, so no other pod can be given those
@@ -189,6 +190,7 @@ ps -eL -o pid,ppid,lwp,nlwp,psr,cgroup,comm | grep <container-id>
   plugin.
 - Partitions for anything other than containers the CPU Manager pinned —
   shared pool containers have nothing exclusive to carve out.
+- Annotation updates on an already deployed Pod.
 - cgroup v1.
 
 ## Layout
@@ -198,7 +200,7 @@ cmd/                        entry point, flags, reconnect loop
 internal/cpuset/            cpu list parsing and set algebra
 internal/cgroup/            cgroup v2 paths and cpuset file access
 internal/partition/         NRI callbacks, state tracking, reconciliation
-deploy/                     DaemonSet and example pods
+deploy/                     DaemonSet and example pods (no Helm chart in this repo)
 ```
 
 The tests in `internal/partition` drive the plugin against a cgroup tree made
