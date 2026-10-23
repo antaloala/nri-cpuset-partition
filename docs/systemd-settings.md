@@ -74,7 +74,9 @@ rm /var/lib/kubelet/cpu_manager_state
 ## 5. Reboot
 
 ```sh
-transactional-update grub.cfg   # only if the kernel command line was edited
+# We are working in a SUSE Linux Micro 6.2 server
+transactional-update grub.cfg   # only if the kernel command line was edited (/etc/default/grub)
+
 reboot
 ```
 
@@ -89,14 +91,3 @@ grep Cpus_allowed_list /proc/1/status                                  # 0-9
 # No drop-in must have been ignored.
 journalctl -b | grep -i "unknown section"
 ```
-
-## Pitfalls
-
-- **Leftover drop-ins.** systemd applies all the drop-ins of a unit in file name order, and
-  the last one setting `AllowedCPUs=` wins. A leftover file (e.g. `50-allowedcpus.conf` with
-  `AllowedCPUs=0-2`) is silently overridden by `50-housekeeping.conf` only because of how the names
-  sort. Check what is actually loaded, and remove anything that is not wanted:
-
-  ```sh
-  systemctl show init.scope system.slice user.slice machine.slice -p Id -p AllowedCPUs -p DropInPaths
-  ```
