@@ -11,7 +11,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build \
         -trimpath \
         -ldflags "-s -w -X main.version=${VERSION}" \
-        -o /out/nri-cpuset-partition ./cmd/nri-cpuset-partition
+        -o /out/nri-cpuset-partition ./cmd
 
 # registry.suse.com/bci/bci-micro:16 is the drop-in alternative if the images
 # have to come from the SUSE registry.
