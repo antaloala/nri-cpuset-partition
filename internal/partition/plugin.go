@@ -150,16 +150,17 @@ func (p *Plugin) Synchronize(ctx context.Context, pods []*api.PodSandbox, contai
 	return nil, nil
 }
 
-// PostCreateContainer runs once the container's cgroup exists and kubelet has
-// put the exclusive cpus in it, which is the earliest point at which the
-// partition can be created.
+// PostCreateContainer is the first event for a new container. Its cgroup does
+// not exist yet: containerd's CRI only creates the runc task, and with it the
+// cgroup, in StartContainer. The cpus NRI reports are enough to reserve them
+// on the ancestors here; the leaf is partitioned at PostStartContainer.
 func (p *Plugin) PostCreateContainer(ctx context.Context, pod *api.PodSandbox, ctr *api.Container) error {
 	p.onContainerEvent(ctx, "PostCreateContainer", pod, ctr)
 	return nil
 }
 
-// PostStartContainer re-checks the container, covering the case where the CPU
-// Manager applied the cpuset only after the container was started.
+// PostStartContainer is where the partition is normally created: the
+// container's cgroup now exists, holding the cpus the CPU Manager assigned.
 func (p *Plugin) PostStartContainer(ctx context.Context, pod *api.PodSandbox, ctr *api.Container) error {
 	p.onContainerEvent(ctx, "PostStartContainer", pod, ctr)
 	return nil
@@ -485,6 +486,13 @@ func (p *Plugin) reconcileLocked(ctx context.Context) {
 		if _, ok := p.applied[id]; ok {
 			continue
 		}
+		if !p.cg.Exists(t.Dir) {
+			// Expected at PostCreateContainer, before the runtime has created
+			// the cgroup; PostStartContainer, or the next resync, retries.
+			p.log.Debug("container cgroup not created yet, partition deferred",
+				"container", t.describe(), "cgroup", t.Dir)
+			continue
+		}
 		if err := p.programLocked(t); err != nil {
 			p.log.Error("cannot create partition", "container", t.describe(),
 				"cpus", t.CPUs.String(), "mode", t.Mode, "err", err)
@@ -521,9 +529,10 @@ func (p *Plugin) programLocked(t *target) error {
 	if !p.cg.Exists(t.Dir) {
 		return fmt.Errorf("cgroup %s does not exist", t.Dir)
 	}
-	if err := p.cg.WriteCPUSet(t.Dir, cgroup.FileExclusive, t.CPUs); err != nil {
-		return err
-	}
+	// The leaf's own cpuset.cpus.exclusive is left empty: for the partition
+	// root itself the kernel takes cpuset.cpus (what the CPU Manager wrote) as
+	// the implicit exclusive set. Only the ancestors need it written, which
+	// reconcileLocked has already done.
 	if err := p.cg.WriteString(t.Dir, cgroup.FilePartition, t.Mode); err != nil {
 		return err
 	}

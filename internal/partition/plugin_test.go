@@ -157,8 +157,8 @@ func TestTwoContainersOfOnePodShareTheReservation(t *testing.T) {
 	}
 	for _, tc := range []struct{ ctrID, cpus string }{{"aaa", "20-21"}, {"bbb", "22-23"}} {
 		rel := ctrScopeRel("A", tc.ctrID)
-		if got := f.read(t, rel, cgroup.FileExclusive); got != tc.cpus {
-			t.Errorf("%s exclusive = %q, want %q", tc.ctrID, got, tc.cpus)
+		if got := f.read(t, rel, cgroup.FileExclusive); got != "" {
+			t.Errorf("%s exclusive = %q, want it left empty", tc.ctrID, got)
 		}
 		if got := f.read(t, rel, cgroup.FilePartition); got != "isolated" {
 			t.Errorf("%s partition = %q, want isolated", tc.ctrID, got)
@@ -370,8 +370,8 @@ func TestResyncRepairsAPartitionKubeletKnockedOut(t *testing.T) {
 	if got := f.read(t, ctrScopeRel("A", "aaa"), cgroup.FilePartition); got != "isolated" {
 		t.Errorf("partition = %q, want it repaired to isolated", got)
 	}
-	if got := f.read(t, ctrScopeRel("A", "aaa"), cgroup.FileExclusive); got != "20-21" {
-		t.Errorf("exclusive = %q, want 20-21", got)
+	if got := f.read(t, ctrScopeRel("A", "aaa"), cgroup.FileExclusive); got != "" {
+		t.Errorf("exclusive = %q, want it left empty", got)
 	}
 }
 
@@ -392,9 +392,6 @@ func TestResyncFollowsANewCPUAssignment(t *testing.T) {
 
 	if got := f.read(t, kubepods, cgroup.FileExclusive); got != "30-31" {
 		t.Errorf("kubepods.slice exclusive = %q, want it to follow to 30-31", got)
-	}
-	if got := f.read(t, ctrScopeRel("A", "aaa"), cgroup.FileExclusive); got != "30-31" {
-		t.Errorf("leaf exclusive = %q, want 30-31", got)
 	}
 	if got := f.read(t, ctrScopeRel("A", "aaa"), cgroup.FilePartition); got != "isolated" {
 		t.Errorf("partition = %q, want isolated", got)
@@ -592,5 +589,39 @@ func TestResyncReleasesAPodWhoseCgroupVanished(t *testing.T) {
 	}
 	if got := f.read(t, ctrScopeRel("B", "bbb"), cgroup.FilePartition); got != "isolated" {
 		t.Errorf("surviving partition = %q, want isolated", got)
+	}
+}
+
+// containerd creates a container's cgroup only when it starts it, so the
+// partition can only be made at PostStartContainer; PostCreateContainer just
+// reserves the cpus on the ancestors.
+func TestPartitionIsCreatedOnceTheCgroupExists(t *testing.T) {
+	f := newFakeTree(t)
+	p := f.newPlugin(t)
+	ctx := context.Background()
+
+	ann := map[string]string{AnnotationPod: "isolated"}
+	pod, ctr := f.addContainer("A", "pod", "app", "aaa", "10-11", ann, "Guaranteed")
+	scope := ctrScopeRel("A", "aaa")
+	if err := os.RemoveAll(filepath.Join(f.root, scope)); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := p.PostCreateContainer(ctx, pod, ctr); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.read(t, kubepods, cgroup.FileExclusive); got != "10-11" {
+		t.Errorf("kubepods.slice exclusive = %q, want 10-11 reserved ahead of the start", got)
+	}
+	if _, ok := p.applied["aaa"]; ok {
+		t.Fatal("partition recorded as applied before the cgroup existed")
+	}
+
+	f.mkcgroup(scope, "10-11")
+	if err := p.PostStartContainer(ctx, pod, ctr); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.read(t, scope, cgroup.FilePartition); got != "isolated" {
+		t.Errorf("partition = %q, want isolated", got)
 	}
 }
