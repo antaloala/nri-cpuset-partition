@@ -119,6 +119,13 @@ func partitionMode(pod *api.PodSandbox, ctr *api.Container) (mode, source string
 	return cgroup.PartitionMember, ""
 }
 
+// isAnnotated reports whether the pod carries a partition annotation that
+// applies to this container, whatever its value.
+func isAnnotated(pod *api.PodSandbox, ctr *api.Container) bool {
+	_, source := partitionMode(pod, ctr)
+	return source != ""
+}
+
 // requestedCPUs recovers the integer number of cpus a container asked for. It
 // reports false when the request is not a whole number of cpus, in which case
 // the CPU Manager did not assign it exclusive cores.
