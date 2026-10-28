@@ -311,9 +311,11 @@ func (p *Plugin) onContainerEvent(ctx context.Context, event string, pod *api.Po
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Kubelet's cpu-manager "static" policy updates every shared pool container each time
-	// an exclusive allocation of cores changes, so most events are about containers that
-	// never asked for a partition. Only trace the ones that did (to reduce log noise).
+	// Kubelet's cpu-manager "static" policy rewrites cpuset.cpus of every container being
+	// assigned the shared pool each time an exclusive allocation of cores changes, so most
+	// container events are about containers that never asked for a partition. Only
+	// annotated containers get this per-event line; the others still get one
+	// "out of scope" line from trackLocked, with the reason.
 	if isAnnotated(pod, ctr) {
 		p.log.Debug("container event", "event", event, "pod", pod.GetName(), "container", ctr.GetName())
 	}
@@ -350,10 +352,7 @@ func (p *Plugin) trackLocked(pod *api.PodSandbox, ctr *api.Container) {
 			// reconcile tears the partition down.
 			p.log.Info("container left the plugin's scope", "container", ctr.GetName(), "reason", reason)
 			delete(ps.managed, ctr.GetId())
-		} else if isAnnotated(pod, ctr) {
-			// Asked for a partition but cannot have one: say why, as this is
-			// what a user debugging a pod that "did nothing" needs to see.
-			// Note that containers that never asked for it are not worth a (log) line.
+		} else {
 			p.log.Debug("container out of scope", "pod", pod.GetName(), "container", ctr.GetName(), "reason", reason)
 		}
 		return
