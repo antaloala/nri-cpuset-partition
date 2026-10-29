@@ -36,6 +36,10 @@ const (
 // cpuset.cpus.exclusive, i.e. it predates the 6.7 remote partition support.
 var ErrNoExclusiveFile = errors.New("cpuset.cpus.exclusive not present (kernel 6.7+ required)")
 
+// ErrCgroupGone is returned when the cgroup directory itself has been removed,
+// typically a container scope deleted by the runtime as the container exits.
+var ErrCgroupGone = errors.New("cgroup no longer exists")
+
 // Manager performs the cgroup v2 reads and writes. A Manager in dry-run mode
 // logs through its writeHook instead of touching the filesystem, which lets
 // the plugin be exercised on a node without changing its state.
@@ -219,8 +223,15 @@ func (m *Manager) Exists(dir string) bool {
 func (m *Manager) ReadString(dir, file string) (string, error) {
 	b, err := os.ReadFile(filepath.Join(dir, file))
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) && file == FileExclusive {
-			return "", fmt.Errorf("%s: %w", dir, ErrNoExclusiveFile)
+		if errors.Is(err, os.ErrNotExist) {
+			// A missing file only says something about the kernel when the
+			// cgroup is still there; otherwise the cgroup has just been removed.
+			if !m.Exists(dir) {
+				return "", fmt.Errorf("%s: %w", dir, ErrCgroupGone)
+			}
+			if file == FileExclusive {
+				return "", fmt.Errorf("%s: %w", dir, ErrNoExclusiveFile)
+			}
 		}
 		return "", err
 	}
@@ -266,6 +277,11 @@ func (m *Manager) WriteString(dir, file, value string) error {
 		payload = "\n"
 	}
 	if err := os.WriteFile(path, []byte(payload), 0o644); err != nil {
+		// The read above succeeded, so a missing cgroup now means it was
+		// removed in between, e.g. a container scope deleted as it exits.
+		if errors.Is(err, os.ErrNotExist) && !m.Exists(dir) {
+			return fmt.Errorf("%s: %w", dir, ErrCgroupGone)
+		}
 		return fmt.Errorf("write %q to %s: %w", value, path, err)
 	}
 

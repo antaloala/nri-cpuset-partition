@@ -1,6 +1,7 @@
 package cgroup
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -236,5 +237,47 @@ func TestFindExclusiveReservations(t *testing.T) {
 	want := []string{kubepods, pod}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("FindExclusiveReservations = %v, want %v", got, want)
+	}
+}
+
+func TestReadStringTellsAGoneCgroupFromAnOldKernel(t *testing.T) {
+	root := t.TempDir()
+	m := testManager(root)
+
+	// The cgroup is still there but the file is not: an old kernel.
+	if _, err := m.ReadString(root, FileExclusive); !errors.Is(err, ErrNoExclusiveFile) {
+		t.Errorf("missing file in an existing cgroup: got %v, want ErrNoExclusiveFile", err)
+	}
+
+	// The whole cgroup is gone: a container scope removed as it exited.
+	gone := filepath.Join(root, "cri-containerd-abc.scope")
+	if _, err := m.ReadString(gone, FileExclusive); !errors.Is(err, ErrCgroupGone) {
+		t.Errorf("removed cgroup: got %v, want ErrCgroupGone", err)
+	}
+	if _, err := m.ReadString(gone, FilePartition); !errors.Is(err, ErrCgroupGone) {
+		t.Errorf("removed cgroup, other file: got %v, want ErrCgroupGone", err)
+	}
+}
+
+// The scope can vanish between WriteString's read and its write. onWrite runs
+// exactly in that window, so removing the cgroup from it reproduces the race.
+func TestWriteStringReportsACgroupRemovedMidWrite(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "cri-containerd-abc.scope")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, FilePartition), []byte("isolated\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := NewManagerAt(root, false, func(string, string) {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	if err := m.WriteString(dir, FilePartition, PartitionMember); !errors.Is(err, ErrCgroupGone) {
+		t.Errorf("got %v, want ErrCgroupGone", err)
 	}
 }

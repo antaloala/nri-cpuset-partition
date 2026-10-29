@@ -14,6 +14,7 @@ package partition
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -555,10 +556,13 @@ func (p *Plugin) demoteLocked(t *target) {
 	if !p.cg.Exists(t.Dir) {
 		return // the container is gone and took its cgroup with it
 	}
-	if err := p.cg.WriteString(t.Dir, cgroup.FilePartition, cgroup.PartitionMember); err != nil {
+	// The runtime removes the scope as the container exits, which can happen
+	// between the check above and the writes below; the kernel dissolves the
+	// partition with the cgroup, so there is nothing left to undo.
+	if err := p.cg.WriteString(t.Dir, cgroup.FilePartition, cgroup.PartitionMember); err != nil && !errors.Is(err, cgroup.ErrCgroupGone) {
 		p.log.Warn("cannot demote partition", "container", t.describe(), "err", err)
 	}
-	if err := p.cg.WriteCPUSet(t.Dir, cgroup.FileExclusive, cpuset.CPUSet{}); err != nil {
+	if err := p.cg.WriteCPUSet(t.Dir, cgroup.FileExclusive, cpuset.CPUSet{}); err != nil && !errors.Is(err, cgroup.ErrCgroupGone) {
 		p.log.Warn("cannot clear exclusive cpus", "container", t.describe(), "err", err)
 	}
 	p.log.Info("partition released", "container", t.describe(), "cpus", t.CPUs.String())
