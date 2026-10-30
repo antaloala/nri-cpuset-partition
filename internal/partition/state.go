@@ -92,37 +92,40 @@ func (p *podState) reserved() cpuset.CPUSet {
 
 // partitionMode resolves the partition value requested for a container.
 //
-// A per-container annotation wins over the pod-wide one (NOTE(2) of the
-// design), and any value that is not "root" or "isolated" degrades to
-// "member", which means the plugin leaves the container alone.
-func partitionMode(pod *api.PodSandbox, ctr *api.Container) (mode, source string) {
-	keys := []string{AnnotationCtrPrefix + ctr.GetName(), AnnotationPod}
+// Only annotations at kubernetes level are looked at: they are the ones a Kubernetes
+// manifest sets (so CRI container annotations are ignored). A per-container partition
+// annotation wins over the pod-wide one (see NOTE(2) of the design), and any value
+// that is not "root" or "isolated" degrades to "member", which means the plugin leaves
+// the container untouched.
+//
+// foundPartitionAnnotation is the annotation key that decided, empty when not found;
+// originalMode is that annotation's value as written, so a typo can be reported as
+// such (instead of as a request for "member").
+func partitionMode(pod *api.PodSandbox, ctr *api.Container) (selectedMode, foundPartitionAnnotation, originalMode string) {
+	annotations := pod.GetAnnotations()
 
-	for _, key := range keys {
-		for _, annotations := range []map[string]string{pod.GetAnnotations(), ctr.GetAnnotations()} {
-			value, ok := annotations[key]
-			if !ok {
-				continue
-			}
-			switch normalized := strings.ToLower(strings.TrimSpace(value)); normalized {
-			case cgroup.PartitionRoot, cgroup.PartitionIsolated:
-				return normalized, key
-			default:
-				// Explicit "member" and anything unrecognised both mean
-				// "nothing to do"; an unrecognised value is reported so a
-				// typo does not fail silently.
-				return cgroup.PartitionMember, key
-			}
+	for _, triedPartitionAnnotation := range []string{AnnotationCtrPrefix + ctr.GetName(), AnnotationPod} {
+		originalMode, ok := annotations[triedPartitionAnnotation]
+		if !ok {
+			continue
+		}
+		switch normalizedMode := strings.ToLower(strings.TrimSpace(originalMode)); normalizedMode {
+		case cgroup.PartitionRoot, cgroup.PartitionIsolated:
+			return normalizedMode, triedPartitionAnnotation, originalMode
+		default:
+			// Explicit "member" and anything unrecognised both mean
+			// "nothing to do"; evaluate tells the two apart in its reason.
+			return cgroup.PartitionMember, triedPartitionAnnotation, originalMode
 		}
 	}
 
-	return cgroup.PartitionMember, ""
+	return cgroup.PartitionMember, "", ""
 }
 
 // isAnnotated reports whether the pod carries a partition annotation that
 // applies to this container, whatever its value.
 func isAnnotated(pod *api.PodSandbox, ctr *api.Container) bool {
-	_, source := partitionMode(pod, ctr)
+	_, source, _ := partitionMode(pod, ctr)
 	return source != ""
 }
 
@@ -154,25 +157,34 @@ func requestedCPUs(ctr *api.Container) (int, bool) {
 // evaluate decides whether a container must be turned into a cpuset partition
 // and returns the target describing the work. It returns a nil target plus the
 // reason when the container is out of scope.
-func (p *Plugin) evaluate(pod *api.PodSandbox, ctr *api.Container) (*target, string, error) {
-	mode, source := partitionMode(pod, ctr)
-	if mode == cgroup.PartitionMember {
-		if source != "" {
-			return nil, fmt.Sprintf("%s requests %q", source, cgroup.PartitionMember), nil
+//
+// refused is set when the container asked for a partition ("root" or
+// "isolated", or a value meant as one) and cannot have it: a misconfiguration
+// the user has to be told about. It is not set for containers that did not ask,
+// for an explicit "member", nor for a reason that clears up on its own.
+func (p *Plugin) evaluate(pod *api.PodSandbox, ctr *api.Container) (t *target, reason string, refused bool, err error) {
+	decidedPartitionMode, foundAnnotation, originalValue := partitionMode(pod, ctr)
+	if decidedPartitionMode == cgroup.PartitionMember {
+		switch {
+		case foundAnnotation == "":
+			return nil, "not annotated", false, nil
+		case strings.EqualFold(strings.TrimSpace(originalValue), cgroup.PartitionMember):
+			return nil, fmt.Sprintf("%s requests %q", foundAnnotation, cgroup.PartitionMember), false, nil
+		default:
+			return nil, fmt.Sprintf("%s has unsupported value %q (want member, root or isolated)", foundAnnotation, originalValue), true, nil
 		}
-		return nil, "not annotated", nil
 	}
 
 	dir, err := p.cg.ContainerDir(ctr.GetLinux().GetCgroupsPath())
 	if err != nil {
-		return nil, "", err
+		return nil, "", false, err
 	}
 	ancestors, err := p.cg.Ancestors(dir)
 	if err != nil {
-		return nil, "", err
+		return nil, "", false, err
 	}
 	if len(ancestors) < 2 {
-		return nil, "", fmt.Errorf("unexpected cgroup layout for %s: %s", ctr.GetName(), dir)
+		return nil, "", false, fmt.Errorf("unexpected cgroup layout for %s: %s", ctr.GetName(), dir)
 	}
 
 	// NOTE(1): the annotation is ignored unless the CPU Manager actually gave
@@ -180,25 +192,26 @@ func (p *Plugin) evaluate(pod *api.PodSandbox, ctr *api.Container) (*target, str
 	// whole number of cpus.
 	podDir := filepath.Dir(dir)
 	if qos := cgroup.QoSClass(podDir); qos != qosClassGuaranteed {
-		return nil, "pod is " + qos + " QoS", nil
+		return nil, "pod is " + qos + " QoS", true, nil
 	}
 	want, haveQuota := requestedCPUs(ctr)
 	if !haveQuota {
-		return nil, "container does not request an integer amount of cpu", nil
+		return nil, "container does not request an integer amount of cpu", true, nil
 	}
 
 	cpus, err := p.assignedCPUs(dir, ctr)
 	if err != nil {
-		return nil, "", err
+		return nil, "", false, err
 	}
 	if cpus.IsEmpty() {
-		return nil, "no cpuset assigned (yet)", nil
+		// Transient: the next event normally finds the cpuset in place.
+		return nil, "no cpuset assigned (yet)", false, nil
 	}
 	// With the static policy the container's cpuset is exactly the cores it
 	// was given. A wider cpuset means it is running out of the shared pool,
 	// so there is nothing exclusive to carve out.
 	if cpus.Size() != want {
-		return nil, fmt.Sprintf("cpuset %s does not match the %d exclusive cpu(s) requested", cpus, want), nil
+		return nil, fmt.Sprintf("cpuset %s does not match the %d exclusive cpu(s) requested", cpus, want), true, nil
 	}
 
 	return &target{
@@ -208,11 +221,11 @@ func (p *Plugin) evaluate(pod *api.PodSandbox, ctr *api.Container) (*target, str
 		Namespace: pod.GetNamespace(),
 		CtrID:     ctr.GetId(),
 		CtrName:   ctr.GetName(),
-		Mode:      mode,
+		Mode:      decidedPartitionMode,
 		CPUs:      cpus,
 		Dir:       dir,
 		Ancestors: ancestors,
-	}, "", nil
+	}, "", false, nil
 }
 
 // assignedCPUs reads the cores the CPU Manager pinned the container to. The

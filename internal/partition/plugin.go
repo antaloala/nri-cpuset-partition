@@ -342,7 +342,7 @@ func (p *Plugin) trackLocked(pod *api.PodSandbox, ctr *api.Container) {
 	}
 	ps.running[ctr.GetId()] = true
 
-	t, reason, err := p.evaluate(pod, ctr)
+	t, reason, refused, err := p.evaluate(pod, ctr)
 	if err != nil {
 		p.log.Error("cannot evaluate container", "pod", pod.GetName(), "container", ctr.GetName(), "err", err)
 		return
@@ -353,6 +353,11 @@ func (p *Plugin) trackLocked(pod *api.PodSandbox, ctr *api.Container) {
 			// reconcile tears the partition down.
 			p.log.Info("container left the plugin's scope", "container", ctr.GetName(), "reason", reason)
 			delete(ps.managed, ctr.GetId())
+		} else if refused {
+			// Asked for a partition and cannot have one: a misconfiguration
+			// the user has to see at the default log level.
+			p.log.Warn("partition request refused", "pod", pod.GetNamespace()+"/"+pod.GetName(),
+				"container", ctr.GetName(), "reason", reason)
 		} else {
 			p.log.Debug("container out of scope", "pod", pod.GetName(), "container", ctr.GetName(), "reason", reason)
 		}

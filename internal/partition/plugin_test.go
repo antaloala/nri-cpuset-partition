@@ -350,6 +350,75 @@ func TestContainerAnnotationOverridesThePodOne(t *testing.T) {
 	}
 }
 
+func TestPartitionModeAndReason(t *testing.T) {
+	f := newFakeTree(t)
+	p := f.newPlugin(t)
+
+	for _, tc := range []struct {
+		name        string
+		podAnn      map[string]string // refers to Kubernetes pod annotations
+		ctrAnn      map[string]string // refers to CRI container annotations (not set at k8s level)
+		wantMode    string
+		wantReason  string
+		wantRefused bool
+	}{
+		{
+			name:       "not annotated",
+			wantMode:   "member",
+			wantReason: "not annotated",
+		},
+		{
+			name:       "explicit member",
+			podAnn:     map[string]string{AnnotationPod: "member"},
+			wantMode:   "member",
+			wantReason: AnnotationPod + ` requests "member"`,
+		},
+		{
+			name:        "typo",
+			podAnn:      map[string]string{AnnotationPod: "isolatd"},
+			wantMode:    "member",
+			wantReason:  AnnotationPod + ` has unsupported value "isolatd" (want member, root or isolated)`,
+			wantRefused: true,
+		},
+		{
+			name:     "case and spaces are tolerated",
+			podAnn:   map[string]string{AnnotationPod: " Isolated "},
+			wantMode: "isolated",
+		},
+		{
+			name:     "container annotation wins",
+			podAnn:   map[string]string{AnnotationPod: "isolated", AnnotationCtrPrefix + "app": "root"},
+			wantMode: "root",
+		},
+		{
+			// Kubernetes cannot set CRI container annotations: they are ignored.
+			name:       "only CRI container annotations",
+			ctrAnn:     map[string]string{AnnotationPod: "isolated"},
+			wantMode:   "member",
+			wantReason: "not annotated",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := &api.PodSandbox{Annotations: tc.podAnn}
+			ctr := &api.Container{Name: "app", Annotations: tc.ctrAnn}
+
+			if mode, _, _ := partitionMode(pod, ctr); mode != tc.wantMode {
+				t.Errorf("mode = %q, want %q", mode, tc.wantMode)
+			}
+			if tc.wantReason == "" {
+				return
+			}
+			_, reason, refused, _ := p.evaluate(pod, ctr)
+			if reason != tc.wantReason {
+				t.Errorf("reason = %q, want %q", reason, tc.wantReason)
+			}
+			if refused != tc.wantRefused {
+				t.Errorf("refused = %v, want %v", refused, tc.wantRefused)
+			}
+		})
+	}
+}
+
 func TestResyncRepairsAPartitionKubeletKnockedOut(t *testing.T) {
 	f := newFakeTree(t)
 	p := f.newPlugin(t)
