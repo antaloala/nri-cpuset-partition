@@ -189,9 +189,70 @@ func requestedCPUs(ctr *api.Container) (int, bool) {
 	return 0, false
 }
 
+// eligibility is what the cpu-manager "static" policy did for a container:
+// either the cores it gave it exclusively, with the cgroups involved, or why
+// it gave it none.
+type eligibility struct {
+	dir       string        // the container's cgroup
+	ancestors []string      // cgroups between the root and dir, outermost first
+	cpus      cpuset.CPUSet // the cores exclusively assigned to it
+	// reason is set when the container has no exclusive cores; transient
+	// tells whether that is expected to clear up by the next event.
+	reason    string
+	transient bool
+}
+
+// exclusiveCPUs checks whether the CPU Manager gave the container exclusive
+// cores, which takes a Guaranteed pod and a container asking for a whole
+// number of cpus (NOTE(1) of the design), and reads them back.
+func (p *Plugin) exclusiveCPUs(ctr *api.Container) (eligibility, error) {
+	dir, err := p.cg.ContainerDir(ctr.GetLinux().GetCgroupsPath())
+	if err != nil {
+		return eligibility{}, err
+	}
+	ancestors, err := p.cg.Ancestors(dir)
+	if err != nil {
+		return eligibility{}, err
+	}
+	if len(ancestors) < 2 {
+		return eligibility{}, fmt.Errorf("unexpected cgroup layout for %s: %s", ctr.GetName(), dir)
+	}
+
+	podDir := filepath.Dir(dir)
+	if qos := cgroup.QoSClass(p.cg.RelPath(podDir)); qos != qosClassGuaranteed {
+		return eligibility{reason: "pod is " + qos + " QoS"}, nil
+	}
+	want, haveQuota := requestedCPUs(ctr)
+	if !haveQuota {
+		return eligibility{reason: "container does not request an integer amount of cpu"}, nil
+	}
+
+	cpus, err := p.assignedCPUs(dir, ctr)
+	if err != nil {
+		return eligibility{}, err
+	}
+	if cpus.IsEmpty() {
+		// Transient: the next event normally finds the cpuset in place.
+		return eligibility{reason: "no cpuset assigned (yet)", transient: true}, nil
+	}
+	// With the static policy the container's cpuset is exactly the cores it
+	// was given. A wider cpuset means it is running out of the shared pool,
+	// so there is nothing exclusive to carve out.
+	if cpus.Size() != want {
+		return eligibility{reason: fmt.Sprintf("cpuset %s does not match the %d exclusive cpu(s) requested", cpus, want)}, nil
+	}
+
+	return eligibility{dir: dir, ancestors: ancestors, cpus: cpus}, nil
+}
+
 // evaluate decides whether a container must be turned into a cpuset partition
 // and returns the target describing the work. It returns a nil target plus the
 // reason when the container is out of scope.
+//
+// The cpu-manager "static" policy conditions are checked first, and the
+// annotations only for a container that meets them: for most containers on a
+// node the answer is that they have no exclusive cores, whatever their pod
+// says, and that is what the reason has to tell.
 //
 // refused is set when the container asked for a partition ("root" or
 // "isolated", or a value meant as one) and cannot have it: a misconfiguration
@@ -202,61 +263,40 @@ func requestedCPUs(ctr *api.Container) (int, bool) {
 // most of them (Burstable, BestEffort, shared pool) are out of scope by design.
 func (p *Plugin) evaluate(pod *api.PodSandbox, ctr *api.Container) (t *target, reason string, refused bool, err error) {
 	decidedPartitionMode, foundAnnotation, originalValue := partitionMode(pod, ctr, p.cfg.NonAnnotatedPodPartition)
-	requested := foundAnnotation != ""
+	explicitMember := strings.EqualFold(strings.TrimSpace(originalValue), cgroup.PartitionMember)
+	// asked: an annotation for this container wants a partition, or meant to.
+	asked := foundAnnotation != "" && !explicitMember
 	modeSource := foundAnnotation
-	if !requested {
+	if foundAnnotation == "" {
 		modeSource = sourceNonAnnotatedPod
 	}
+
+	// 1. Did the CPU Manager give the container exclusive cores?
+	e, err := p.exclusiveCPUs(ctr)
+	if err != nil {
+		if decidedPartitionMode == cgroup.PartitionMember && !asked {
+			// Not annotated, or explicitly "member": nothing would be done
+			// for it anyway, so not worth an error.
+			return nil, "cannot locate its cgroup: " + err.Error(), false, nil
+		}
+		return nil, "", false, err
+	}
+	if e.reason != "" {
+		return nil, "no exclusive cpus from the CPU Manager: " + e.reason, asked && !e.transient, nil
+	}
+
+	// 2. It did: does anything ask for a partition?
 	if decidedPartitionMode == cgroup.PartitionMember {
 		switch {
 		case foundAnnotation == "" && hasPartitionAnnotations(pod):
-			return nil, "pod's " + AnnotationDomain + " annotations do not cover this container", false, nil
+			return nil, "has exclusive cpus, but the pod's " + AnnotationDomain + " annotations do not cover this container", false, nil
 		case foundAnnotation == "":
-			return nil, "not annotated", false, nil
-		case strings.EqualFold(strings.TrimSpace(originalValue), cgroup.PartitionMember):
+			return nil, "has exclusive cpus, but the pod is not annotated", false, nil
+		case explicitMember:
 			return nil, fmt.Sprintf("%s requests %q", foundAnnotation, cgroup.PartitionMember), false, nil
 		default:
 			return nil, fmt.Sprintf("%s has unsupported value %q (want member, root or isolated)", foundAnnotation, originalValue), true, nil
 		}
-	}
-
-	dir, err := p.cg.ContainerDir(ctr.GetLinux().GetCgroupsPath())
-	if err != nil {
-		return nil, "", false, err
-	}
-	ancestors, err := p.cg.Ancestors(dir)
-	if err != nil {
-		return nil, "", false, err
-	}
-	if len(ancestors) < 2 {
-		return nil, "", false, fmt.Errorf("unexpected cgroup layout for %s: %s", ctr.GetName(), dir)
-	}
-
-	// NOTE(1): the annotation is ignored unless the CPU Manager actually gave
-	// the container exclusive cores, which takes a Guaranteed pod asking for a
-	// whole number of cpus.
-	podDir := filepath.Dir(dir)
-	if qos := cgroup.QoSClass(p.cg.RelPath(podDir)); qos != qosClassGuaranteed {
-		return nil, "pod is " + qos + " QoS", requested, nil
-	}
-	want, haveQuota := requestedCPUs(ctr)
-	if !haveQuota {
-		return nil, "container does not request an integer amount of cpu", requested, nil
-	}
-
-	cpus, err := p.assignedCPUs(dir, ctr)
-	if err != nil {
-		return nil, "", false, err
-	}
-	if cpus.IsEmpty() {
-		// Transient: the next event normally finds the cpuset in place.
-		return nil, "no cpuset assigned (yet)", false, nil
-	}
-	// With the static policy the container's cpuset is exactly the cores it
-	// was given. A wider cpuset means it is running out of the shared pool,
-	// so there is nothing exclusive to carve out.
-	if cpus.Size() != want {
-		return nil, fmt.Sprintf("cpuset %s does not match the %d exclusive cpu(s) requested", cpus, want), requested, nil
 	}
 
 	return &target{
@@ -268,9 +308,9 @@ func (p *Plugin) evaluate(pod *api.PodSandbox, ctr *api.Container) (t *target, r
 		CtrName:    ctr.GetName(),
 		Mode:       decidedPartitionMode,
 		ModeSource: modeSource,
-		CPUs:       cpus,
-		Dir:        dir,
-		Ancestors:  ancestors,
+		CPUs:       e.cpus,
+		Dir:        e.dir,
+		Ancestors:  e.ancestors,
 	}, "", false, nil
 }
 

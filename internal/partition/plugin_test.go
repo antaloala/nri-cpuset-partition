@@ -358,13 +358,13 @@ func TestContainerAnnotationOverridesThePodOne(t *testing.T) {
 }
 
 func TestPartitionModeAndReason(t *testing.T) {
-	f := newFakeTree(t)
-	p := f.newPlugin(t)
+	const noExclusive = "no exclusive cpus from the CPU Manager: "
 
 	for _, tc := range []struct {
 		name        string
 		podAnn      map[string]string // refers to Kubernetes pod annotations
 		ctrAnn      map[string]string // refers to CRI container annotations (not set at k8s level)
+		qos         string            // empty: Guaranteed
 		wantMode    string
 		wantReason  string
 		wantRefused bool
@@ -372,7 +372,7 @@ func TestPartitionModeAndReason(t *testing.T) {
 		{
 			name:       "not annotated",
 			wantMode:   "member",
-			wantReason: "not annotated",
+			wantReason: "has exclusive cpus, but the pod is not annotated",
 		},
 		{
 			name:       "explicit member",
@@ -402,12 +402,42 @@ func TestPartitionModeAndReason(t *testing.T) {
 			name:       "only CRI container annotations",
 			ctrAnn:     map[string]string{AnnotationPod: "isolated"},
 			wantMode:   "member",
-			wantReason: "not annotated",
+			wantReason: "has exclusive cpus, but the pod is not annotated",
+		},
+		{
+			// The static policy conditions come first: without exclusive cpus,
+			// that is the reason, whatever the annotations say.
+			name:       "no exclusive cpus, not annotated",
+			qos:        "Burstable",
+			wantMode:   "member",
+			wantReason: noExclusive + "pod is Burstable QoS",
+		},
+		{
+			name:        "no exclusive cpus, but asks for a partition",
+			podAnn:      map[string]string{AnnotationPod: "isolated"},
+			qos:         "Burstable",
+			wantMode:    "isolated",
+			wantReason:  noExclusive + "pod is Burstable QoS",
+			wantRefused: true,
+		},
+		{
+			name:       "no exclusive cpus, explicit member",
+			podAnn:     map[string]string{AnnotationPod: "member"},
+			qos:        "BestEffort",
+			wantMode:   "member",
+			wantReason: noExclusive + "pod is BestEffort QoS",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			pod := &api.PodSandbox{Annotations: tc.podAnn}
-			ctr := &api.Container{Name: "app", Annotations: tc.ctrAnn}
+			f := newFakeTree(t)
+			p := f.newPlugin(t)
+
+			qos := tc.qos
+			if qos == "" {
+				qos = "Guaranteed"
+			}
+			pod, ctr := f.addContainer("A", "pod", "app", "aaa", "10-11", tc.podAnn, qos)
+			ctr.Annotations = tc.ctrAnn
 
 			if mode, _, _ := partitionMode(pod, ctr, cgroup.PartitionMember); mode != tc.wantMode {
 				t.Errorf("mode = %q, want %q", mode, tc.wantMode)
@@ -415,7 +445,10 @@ func TestPartitionModeAndReason(t *testing.T) {
 			if tc.wantReason == "" {
 				return
 			}
-			_, reason, refused, _ := p.evaluate(pod, ctr)
+			_, reason, refused, err := p.evaluate(pod, ctr)
+			if err != nil {
+				t.Fatal(err)
+			}
 			if reason != tc.wantReason {
 				t.Errorf("reason = %q, want %q", reason, tc.wantReason)
 			}
@@ -729,7 +762,7 @@ func TestNonAnnotatedPodPartition(t *testing.T) {
 			annotations: map[string]string{AnnotationCtrPrefix + "other": "isolated"},
 			qos:         "Guaranteed",
 			wantMode:    "member",
-			wantReason:  "pod's " + AnnotationDomain + " annotations do not cover this container",
+			wantReason:  "has exclusive cpus, but the pod's " + AnnotationDomain + " annotations do not cover this container",
 		},
 		{
 			// A mistyped key still makes the pod an annotated one.
@@ -737,7 +770,7 @@ func TestNonAnnotatedPodPartition(t *testing.T) {
 			annotations: map[string]string{AnnotationDomain + "/containr.app": "isolated"},
 			qos:         "Guaranteed",
 			wantMode:    "member",
-			wantReason:  "pod's " + AnnotationDomain + " annotations do not cover this container",
+			wantReason:  "has exclusive cpus, but the pod's " + AnnotationDomain + " annotations do not cover this container",
 		},
 		{
 			name:        "explicit member",
@@ -1012,6 +1045,45 @@ func TestCheckPodTreeWarnsWhenTheTreeIsMissing(t *testing.T) {
 			}
 			if !tc.wantOK && !strings.Contains(logs.String(), "--kubepods-cgroup=kubepods") {
 				t.Errorf("warning does not say how to fix it; log: %s", logs.String())
+			}
+		})
+	}
+}
+
+// A container whose cgroup cannot be located is only worth an error when
+// something asked for its partition; for one that asked for nothing, not
+// annotated or explicitly "member", it is a debug-level reason.
+func TestUnlocatableCgroupIsAnErrorOnlyWhenAPartitionWasAsked(t *testing.T) {
+	f := newFakeTree(t)
+	p := f.newPlugin(t)
+
+	for _, tc := range []struct {
+		name      string
+		podAnn    map[string]string
+		wantError bool
+	}{
+		{name: "not annotated"},
+		{name: "explicit member", podAnn: map[string]string{AnnotationPod: "member"}},
+		{name: "asks for isolated", podAnn: map[string]string{AnnotationPod: "isolated"}, wantError: true},
+		{name: "typo", podAnn: map[string]string{AnnotationPod: "isolatd"}, wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// No cgroups path at all: ContainerDir cannot locate the cgroup.
+			pod := &api.PodSandbox{Annotations: tc.podAnn}
+			ctr := &api.Container{Name: "app"}
+
+			_, reason, refused, err := p.evaluate(pod, ctr)
+			if tc.wantError {
+				if err == nil {
+					t.Errorf("no error (reason %q), want one", reason)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("error %v, want a debug-level reason", err)
+			}
+			if !strings.HasPrefix(reason, "cannot locate its cgroup: ") || refused {
+				t.Errorf("reason = %q, refused = %v; want a \"cannot locate its cgroup\" reason, not refused", reason, refused)
 			}
 		})
 	}
