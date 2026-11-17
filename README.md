@@ -253,13 +253,17 @@ running workloads lose their partition for a moment.
 Limits:
 
 - A pod that starts while the plugin is down **runs without its partition
-  until the plugin comes back.** NRI cannot hold a container back waiting for
-  a plugin that is not connected. Deploy the plugin before the workloads that
-  depend on it. The chart's `system-node-critical` priority class helps it get
-  scheduled first on a node.
+  until the plugin comes back**: NRI cannot hold a container back waiting for
+  a plugin that is not connected. When the plugin connects, `Synchronize`
+  partitions the pod. Kubernetes does not order pod start-up on a node, so
+  this window cannot be closed entirely; deploy the plugin before the
+  workloads that depend on it. The chart's `system-node-critical` priority
+  class (`prioritySettings.nriCpusetPartitionPlugin.priorityClassName`) keeps
+  the plugin from being evicted or preempted once it runs, but does not make
+  it start first.
 - Steps 2 and 3 release **any** cpu reservation and/or `root`/`isolated` partition
   in the Guaranteed pods' part of `kubepods.slice` that no container should have,
-  not only the ones this plugin created. Don't create partitions or exclusive
+  not only the ones this plugin created. Do not create partitions or exclusive cpu
   reservations for Guaranteed pods by other means on a node running this
   plugin. The Burstable and BestEffort slices are, instead, never touched.
 
