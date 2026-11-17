@@ -597,6 +597,23 @@ func (p *Plugin) demoteLocked(t *target) {
 	p.log.Info("partition released", "container", t.describe(), "cpus", t.CPUs.String())
 }
 
+// CheckPodTree warns when the pod cgroup tree named by --kubepods-cgroup does
+// not exist, and reports whether it does. Without it the startup scans
+// (adoptStaleReservationsLocked, adoptOrphanPartitionsLocked) silently find
+// nothing, so leftovers of a previous run are never cleaned up; partitions are
+// still created and released normally. The usual cause is kubelet's cgroupfs
+// driver, whose tree is "kubepods" instead of the default "kubepods.slice".
+func (p *Plugin) CheckPodTree() bool {
+	dir := filepath.Join(p.cg.Root(), p.cfg.KubepodsCgroup)
+	if p.cg.Exists(dir) {
+		return true
+	}
+	p.log.Warn("pod cgroup tree not found: reservations and partitions left by a previous run "+
+		"will not be cleaned up at startup; with kubelet's cgroupfs driver set --kubepods-cgroup=kubepods",
+		"cgroup", dir)
+	return false
+}
+
 // adoptStaleReservationsLocked finds reservations a previous run of the plugin
 // left on the pod cgroup tree, so that the reconcile can clear the ones no
 // running container needs any more.

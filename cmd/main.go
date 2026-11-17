@@ -97,6 +97,7 @@ func run() error {
 		"nonAnnotatedPodPartition", cfg.NonAnnotatedPodPartition, "dryRun", *dryRun)
 
 	plugin := partition.New(cfg, cg, log)
+	plugin.CheckPodTree()
 
 	opts := []stub.Option{
 		stub.WithPluginName(*pluginName),

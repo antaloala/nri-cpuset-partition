@@ -61,6 +61,12 @@ and why `root` value exists as the middle ground.
   reservation: either `reservedSystemCPUs` (recommended in this scope, as it lets you choose
   which cores are reserved and keep them aligned with the housekeeping cores)
   or `kubeReserved`/`systemReserved` cpu.
+- Kubelet's `systemd` cgroup driver (`cgroupDriver: systemd`, the RKE2
+  default on systemd hosts). This is the tested configuration. The `cgroupfs`
+  driver is handled by the code, which then needs `--kubepods-cgroup=kubepods`,
+  but it has never been run on a real node. If the `--kubepods-cgroup`
+  directory doesn't exist, the plugin logs a warning at startup: partitions
+  still work, but leftovers from a previous run aren't cleaned up.
 - Go 1.26+ to build.
 
 ## The new pod annotation
@@ -213,12 +219,14 @@ plugin:
    running but no longer in scope, for example after restarting the plugin
    with a different `--partition-value-for-non-annotated-pod` value.
 
-   NOTE: Both walks (in bullets 2. and 3. above) skip `kubepods-burstable.slice`
-   and `kubepods-besteffort.slice` folders (i.e., `burstable` and `besteffort` pods'
-   cgroups folders with kubelet's `cgroupfs` driver). Only Guaranteed pods, whose
-   slices sit directly under `kubepods.slice` folder, ever get a reservation or a
-   partition from this plugin, and a pod cannot change QoS class. So nothing under
-   those two slices was set by the plugin, and it's not the plugin's to release.
+   NOTE: Both walks (in steps 2 and 3 above) skip the Burstable and
+   BestEffort QoS slices: `kubepods-burstable.slice` and
+   `kubepods-besteffort.slice` with kubelet's `systemd` cgroup driver (the
+   RKE2 default on systemd hosts), or `burstable` and `besteffort` with the
+   `cgroupfs` driver. Only Guaranteed pods, whose slices sit directly under
+   `kubepods.slice`, ever get a reservation or a partition from this plugin,
+   and a pod cannot change QoS class. So nothing under those two slices was set
+   by the plugin, and it's not the plugin's to release.
 4. **Runs the normal reconcile** in its usual order: demote the unwanted
    partitions to `member` first, then rewrite the ancestors'
    `cpuset.cpus.exclusive`, parents before children, then create the missing
@@ -246,14 +254,14 @@ Limits:
 
 - A pod that starts while the plugin is down **runs without its partition
   until the plugin comes back.** NRI cannot hold a container back waiting for
-  a plugin that isn't connected. Deploy the plugin before the workloads that
+  a plugin that is not connected. Deploy the plugin before the workloads that
   depend on it. The chart's `system-node-critical` priority class helps it get
   scheduled first on a node.
-- Steps 2 and 3 release **any** reservation or `root`/`isolated` partition in
-  the Guaranteed pods' part of `kubepods.slice` that no container should have,
+- Steps 2 and 3 release **any** cpu reservation and/or `root`/`isolated` partition
+  in the Guaranteed pods' part of `kubepods.slice` that no container should have,
   not only the ones this plugin created. Don't create partitions or exclusive
   reservations for Guaranteed pods by other means on a node running this
-  plugin. The Burstable and BestEffort slices are never touched.
+  plugin. The Burstable and BestEffort slices are, instead, never touched.
 
 ## Build and deploy
 
@@ -284,7 +292,7 @@ containers and computes the right cpu sets on a given node.
 | `--plugin-index` | `10` | NRI plugin index, which decides the order of plugins. Must be exactly two digits: containerd rejects anything else at registration, and the plugin then retries forever without running. The Helm chart sets `50`. |
 | `--nri-socket` | NRI default (`/var/run/nri/nri.sock`) | Path of the NRI socket to connect to. |
 | `--cgroup-root` | autodetected | Mount point of the cgroup v2 hierarchy, found from `/proc/self/mountinfo` when not set. |
-| `--kubepods-cgroup` | `kubepods.slice` | Name of the pod cgroup tree below the cgroup root. Only used at startup to find and clear reservations left behind by a previous run. With kubelet's `cgroupfs` driver it is `kubepods`. |
+| `--kubepods-cgroup` | `kubepods.slice` | Name of the pod cgroup tree below the cgroup root. Only used at startup to find and clear reservations and partitions left behind by a previous run. With kubelet's `cgroupfs` driver it is `kubepods`. If the directory doesn't exist, the plugin logs a warning at startup and skips that cleanup. |
 | `--version` | | Print the version and exit. |
 
 Flags take one or two leading dashes, and boolean flags can be given bare

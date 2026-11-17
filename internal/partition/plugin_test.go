@@ -1,11 +1,13 @@
 package partition
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -970,5 +972,47 @@ func TestQoSIsReadBelowTheCgroupRoot(t *testing.T) {
 
 	if got := f.read(t, ctrScopeRel("A", "aaa"), cgroup.FilePartition); got != "isolated" {
 		t.Errorf("partition = %q, want isolated", got)
+	}
+}
+
+// A missing pod cgroup tree (typically kubelet's cgroupfs driver with the
+// default --kubepods-cgroup) must be reported at WARN level, not hidden in a
+// debug line, as the startup cleanup silently does nothing without it.
+func TestCheckPodTreeWarnsWhenTheTreeIsMissing(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		kubepods string
+		wantOK   bool
+	}{
+		{name: "tree present", kubepods: "kubepods.slice", wantOK: true},
+		{name: "cgroupfs node with the default name", kubepods: "kubepods.slice"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			if tc.wantOK {
+				if err := os.MkdirAll(filepath.Join(root, tc.kubepods), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.MkdirAll(filepath.Join(root, "kubepods"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			var logs bytes.Buffer
+			cfg := DefaultConfig()
+			cfg.KubepodsCgroup = tc.kubepods
+			p := New(cfg, cgroup.NewManagerAt(root, false, nil),
+				slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+			if got := p.CheckPodTree(); got != tc.wantOK {
+				t.Errorf("CheckPodTree() = %v, want %v", got, tc.wantOK)
+			}
+			warned := strings.Contains(logs.String(), "level=WARN")
+			if warned == tc.wantOK {
+				t.Errorf("warning logged = %v, want %v; log: %s", warned, !tc.wantOK, logs.String())
+			}
+			if !tc.wantOK && !strings.Contains(logs.String(), "--kubepods-cgroup=kubepods") {
+				t.Errorf("warning does not say how to fix it; log: %s", logs.String())
+			}
+		})
 	}
 }
