@@ -85,6 +85,19 @@ func NewManagerAt(root string, dryRun bool, onWrite func(path, value string)) *M
 // Root is the cgroup v2 mount point.
 func (m *Manager) Root() string { return m.root }
 
+// RelPath returns dir relative to the cgroup root, i.e. the part of the path
+// that kubelet and the runtime control. Name-based checks such as QoSClass
+// must look at this part only, so that the mount point above it, or a test's
+// temporary directory, cannot be mistaken for a QoS slice. A dir that is not
+// below the root is returned unchanged.
+func (m *Manager) RelPath(dir string) string {
+	rel, err := filepath.Rel(m.root, dir)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return dir
+	}
+	return rel
+}
+
 // DryRun reports whether writes are suppressed.
 func (m *Manager) DryRun() bool { return m.dryRun }
 
@@ -318,6 +331,9 @@ func (m *Manager) ReadPartition(dir string) (PartitionState, error) {
 // QoSClass derives the pod QoS class from its cgroup path. Kubelet nests
 // Burstable and BestEffort pods under their own slice, while Guaranteed pods
 // sit directly below the kubepods root.
+//
+// It matches the slice names anywhere in podDir, so pass a path relative to
+// the cgroup root (Manager.RelPath), not an absolute one.
 func QoSClass(podDir string) string {
 	switch lower := strings.ToLower(podDir); {
 	case strings.Contains(lower, "besteffort"):
@@ -329,9 +345,28 @@ func QoSClass(podDir string) string {
 	}
 }
 
+// isNonGuaranteedQoSSlice reports whether dir, below the pod cgroup tree
+// subtree, is (or lies below) kubelet's Burstable or BestEffort QoS slice,
+// e.g. kubepods.slice/kubepods-burstable.slice, or kubepods/besteffort with
+// the cgroupfs driver. Only Guaranteed pods, whose slices sit directly under
+// the subtree, ever get a reservation or a partition from the plugin, so the
+// scans below never look into those slices: whatever is there was not set by
+// the plugin and is not its to release.
+//
+// The check is made on the path relative to subtree, so that the cgroup root
+// above it cannot be mistaken for a QoS slice.
+func isNonGuaranteedQoSSlice(subtree, dir string) bool {
+	rel, err := filepath.Rel(subtree, dir)
+	if err != nil || rel == "." {
+		return false
+	}
+	return QoSClass(rel) != "Guaranteed"
+}
+
 // FindExclusiveReservations walks a cgroup subtree and returns every directory
-// that currently has a non-empty cpuset.cpus.exclusive. It is used at startup
-// to adopt reservations left behind by a previous run of the plugin.
+// that currently has a non-empty cpuset.cpus.exclusive, leaving out the
+// Burstable and BestEffort QoS slices. It is used at startup to adopt
+// reservations left behind by a previous run of the plugin.
 func (m *Manager) FindExclusiveReservations(subtree string) ([]string, error) {
 	var found []string
 
@@ -345,12 +380,54 @@ func (m *Manager) FindExclusiveReservations(subtree string) ([]string, error) {
 		if !d.IsDir() {
 			return nil
 		}
+		if isNonGuaranteedQoSSlice(subtree, path) {
+			return filepath.SkipDir
+		}
 		set, err := m.ReadCPUSet(path, FileExclusive)
 		if err != nil {
 			return nil //nolint:nilerr // a cgroup without the file is simply not interesting
 		}
 		if !set.IsEmpty() {
 			found = append(found, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("scan %s: %w", subtree, err)
+	}
+
+	return found, nil
+}
+
+// FindPartitionRoots walks a cgroup subtree and returns the partition state of
+// every cgroup below it whose cpuset.cpus.partition is "root" or "isolated",
+// valid or not. The subtree's own cgroup and the Burstable and BestEffort QoS
+// slices are left out. It is used at startup to find partitions a previous run
+// of the plugin created and no longer wants; since the plugin leaves a
+// partition's own cpuset.cpus.exclusive empty, FindExclusiveReservations
+// cannot see them.
+func (m *Manager) FindPartitionRoots(subtree string) (map[string]PartitionState, error) {
+	found := map[string]PartitionState{}
+
+	err := filepath.WalkDir(subtree, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil // the tree moves under us; skip what disappeared
+			}
+			return err
+		}
+		if !d.IsDir() || path == subtree {
+			return nil
+		}
+		if isNonGuaranteedQoSSlice(subtree, path) {
+			return filepath.SkipDir
+		}
+		state, err := m.ReadPartition(path)
+		if err != nil {
+			return nil //nolint:nilerr // a cgroup without the file is simply not interesting
+		}
+		if state.Value == PartitionRoot || state.Value == PartitionIsolated {
+			found[path] = state
 		}
 		return nil
 	})

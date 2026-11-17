@@ -53,6 +53,7 @@ func run() error {
 		kubepods    = flag.String("kubepods-cgroup", defaults.KubepodsCgroup, "name of the pod cgroup tree below the cgroup root")
 		resync      = flag.Duration("resync-period", defaults.ResyncPeriod, "how often to re-check that the partitions are still in place (0 disables)")
 		cleanup     = flag.Bool("cleanup-on-exit", defaults.CleanupOnExit, "release every partition when the plugin stops")
+		nonAnnotPod = flag.String("partition-value-for-non-annotated-pod", defaults.NonAnnotatedPodPartition, "member, root or isolated: partition for containers with exclusive cpus in pods with no cpuset-partition.nri.io annotation at all (member: leave them alone)")
 		dryRun      = flag.Bool("dry-run", false, "log the cgroup writes instead of performing them")
 		logLevel    = flag.String("log-level", "info", "debug, info, warn or error")
 		showVersion = flag.Bool("version", false, "print the version and exit")
@@ -78,17 +79,23 @@ func run() error {
 		log.Debug("writing", "path", path, "value", value)
 	}
 
+	cfg := partition.Config{
+		KubepodsCgroup:           *kubepods,
+		ResyncPeriod:             *resync,
+		CleanupOnExit:            *cleanup,
+		NonAnnotatedPodPartition: *nonAnnotPod,
+	}
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+
 	cg, err := cgroup.NewManager(*cgroupRoot, *dryRun, onWrite)
 	if err != nil {
 		return err
 	}
-	log.Info("starting", "version", version, "cgroupRoot", cg.Root(), "dryRun", *dryRun)
+	log.Info("starting", "version", version, "cgroupRoot", cg.Root(),
+		"nonAnnotatedPodPartition", cfg.NonAnnotatedPodPartition, "dryRun", *dryRun)
 
-	cfg := partition.Config{
-		KubepodsCgroup: *kubepods,
-		ResyncPeriod:   *resync,
-		CleanupOnExit:  *cleanup,
-	}
 	plugin := partition.New(cfg, cg, log)
 
 	opts := []stub.Option{

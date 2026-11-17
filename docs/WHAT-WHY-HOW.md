@@ -131,7 +131,7 @@ cpuset-partition.nri.io/container.<container_name>: <annotation_value>
   amount of CPU (and so are exclusively assigned a set of cores by the CPU Manager "static" policy)
   but are missing "their" `cpuset-partition.nri.io/container.<container_name>` annotation.
 
-Supported annotation values (see <https://kernel-internals.org/sched/cpuset/>):
+Supported annotation values (see "Partions roots (V2)" chaper in <https://kernel-internals.org/sched/cpuset/>):
 
 | Value | Meaning |
 | --- | --- |

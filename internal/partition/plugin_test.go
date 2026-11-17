@@ -118,8 +118,13 @@ func (f *fakeTree) read(t *testing.T, rel, file string) string {
 
 func (f *fakeTree) newPlugin(t *testing.T) *Plugin {
 	t.Helper()
+	return f.newPluginWith(t, DefaultConfig())
+}
+
+func (f *fakeTree) newPluginWith(t *testing.T, cfg Config) *Plugin {
+	t.Helper()
 	cg := cgroup.NewManagerAt(f.root, false, nil)
-	return New(DefaultConfig(), cg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return New(cfg, cg, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 func podSliceRel(uid string) string {
@@ -402,7 +407,7 @@ func TestPartitionModeAndReason(t *testing.T) {
 			pod := &api.PodSandbox{Annotations: tc.podAnn}
 			ctr := &api.Container{Name: "app", Annotations: tc.ctrAnn}
 
-			if mode, _, _ := partitionMode(pod, ctr); mode != tc.wantMode {
+			if mode, _, _ := partitionMode(pod, ctr, cgroup.PartitionMember); mode != tc.wantMode {
 				t.Errorf("mode = %q, want %q", mode, tc.wantMode)
 			}
 			if tc.wantReason == "" {
@@ -691,6 +696,279 @@ func TestPartitionIsCreatedOnceTheCgroupExists(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := f.read(t, scope, cgroup.FilePartition); got != "isolated" {
+		t.Errorf("partition = %q, want isolated", got)
+	}
+}
+
+// --partition-value-for-non-annotated-pod reaches the containers with
+// exclusive cpus of pods that carry no cpuset-partition.nri.io annotation at
+// all, and nothing else: in a pod with any such annotation, even one only for
+// other containers, an uncovered container stays "member"; and out-of-scope
+// containers are neither partitioned nor reported as refused.
+func TestNonAnnotatedPodPartition(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		annotations map[string]string
+		qos         string
+		quota       int64
+		wantMode    string
+		wantSource  string
+		wantReason  string
+	}{
+		{
+			name:       "non-annotated pod gets the value",
+			qos:        "Guaranteed",
+			wantMode:   "isolated",
+			wantSource: sourceNonAnnotatedPod,
+		},
+		{
+			// The pod's author chose which containers get a partition.
+			name:        "pod annotated only for another container",
+			annotations: map[string]string{AnnotationCtrPrefix + "other": "isolated"},
+			qos:         "Guaranteed",
+			wantMode:    "member",
+			wantReason:  "pod's " + AnnotationDomain + " annotations do not cover this container",
+		},
+		{
+			// A mistyped key still makes the pod an annotated one.
+			name:        "pod with an unrecognised annotation key",
+			annotations: map[string]string{AnnotationDomain + "/containr.app": "isolated"},
+			qos:         "Guaranteed",
+			wantMode:    "member",
+			wantReason:  "pod's " + AnnotationDomain + " annotations do not cover this container",
+		},
+		{
+			name:        "explicit member",
+			annotations: map[string]string{AnnotationPod: "member"},
+			qos:         "Guaranteed",
+			wantMode:    "member",
+		},
+		{
+			// A mistyped opt-out must not turn into an isolated partition.
+			name:        "typo in the value",
+			annotations: map[string]string{AnnotationPod: "membr"},
+			qos:         "Guaranteed",
+			wantMode:    "member",
+		},
+		{
+			name:        "annotation for the container",
+			annotations: map[string]string{AnnotationCtrPrefix + "app": "root"},
+			qos:         "Guaranteed",
+			wantMode:    "root",
+			wantSource:  AnnotationCtrPrefix + "app",
+		},
+		{
+			name:     "non-annotated burstable pod is left alone",
+			qos:      "Burstable",
+			wantMode: "member",
+		},
+		{
+			name:     "non-annotated fractional cpu is left alone",
+			qos:      "Guaranteed",
+			quota:    150000,
+			wantMode: "member",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeTree(t)
+			cfg := DefaultConfig()
+			cfg.NonAnnotatedPodPartition = cgroup.PartitionIsolated
+			p := f.newPluginWith(t, cfg)
+
+			pod, ctr := f.addContainer("A", "pod", "app", "aaa", "10-11", tc.annotations, tc.qos)
+			if tc.quota != 0 {
+				ctr.Linux.Resources.Cpu.Quota = api.Int64(tc.quota)
+			}
+
+			target, reason, refused, err := p.evaluate(pod, ctr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Out-of-scope containers reached only by the flag are not a user
+			// request, so they must not be reported as refused.
+			if target == nil && refused && tc.annotations == nil {
+				t.Error("a container of a non-annotated pod was reported as refused")
+			}
+			if tc.wantReason != "" && reason != tc.wantReason {
+				t.Errorf("reason = %q, want %q", reason, tc.wantReason)
+			}
+
+			if err := p.PostStartContainer(context.Background(), pod, ctr); err != nil {
+				t.Fatal(err)
+			}
+
+			applied, ok := p.applied["aaa"]
+			if tc.wantMode == cgroup.PartitionMember {
+				if ok {
+					t.Fatalf("container partitioned as %q, want it left alone", applied.Mode)
+				}
+				if got := f.read(t, kubepods, cgroup.FileExclusive); got != "" {
+					t.Errorf("kubepods.slice exclusive = %q, want no reservation", got)
+				}
+				return
+			}
+			if !ok {
+				t.Fatalf("container not partitioned, want %q", tc.wantMode)
+			}
+			if applied.Mode != tc.wantMode || applied.ModeSource != tc.wantSource {
+				t.Errorf("partition = %q from %q, want %q from %q",
+					applied.Mode, applied.ModeSource, tc.wantMode, tc.wantSource)
+			}
+		})
+	}
+}
+
+func TestConfigValidate(t *testing.T) {
+	for _, value := range []string{"member", "root", "isolated"} {
+		cfg := DefaultConfig()
+		cfg.NonAnnotatedPodPartition = value
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("partition value %q rejected: %v", value, err)
+		}
+	}
+	// Values are matched exactly: unlike annotations, a flag is set once by
+	// an operator, and a wrong one has to stop the plugin, not be tolerated.
+	for _, value := range []string{"", "Isolated", "isolatd", "invalid"} {
+		cfg := DefaultConfig()
+		cfg.NonAnnotatedPodPartition = value
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("partition value %q accepted, want an error", value)
+		}
+	}
+}
+
+func TestConfigureRejectsAnInvalidNonAnnotatedPodPartition(t *testing.T) {
+	f := newFakeTree(t)
+	p := f.newPlugin(t)
+	ctx := context.Background()
+
+	if _, err := p.Configure(ctx, `{"nonAnnotatedPodPartition": "isolatd"}`, "containerd", "v2"); err == nil {
+		t.Fatal("an invalid nonAnnotatedPodPartition was accepted")
+	}
+	if got := p.cfg.NonAnnotatedPodPartition; got != cgroup.PartitionMember {
+		t.Errorf("partition value = %q after a rejected configuration, want it unchanged", got)
+	}
+
+	if _, err := p.Configure(ctx, `{"nonAnnotatedPodPartition": "root"}`, "containerd", "v2"); err != nil {
+		t.Fatal(err)
+	}
+	if got := p.cfg.NonAnnotatedPodPartition; got != cgroup.PartitionRoot {
+		t.Errorf("partition value = %q, want root", got)
+	}
+}
+
+// A previous run partitioned a non-annotated pod's container through
+// --partition-value-for-non-annotated-pod=isolated, and the plugin restarts
+// with the default "member": the partition must be released, and released
+// before the ancestors' reservation it depends on is withdrawn.
+func TestSynchronizeReleasesAPartitionNoContainerWants(t *testing.T) {
+	f := newFakeTree(t)
+	pod, ctr := f.addContainer("A", "pod", "app", "aaa", "10-11", nil, "Guaranteed")
+	write(t, filepath.Join(f.root, kubepods), cgroup.FileExclusive, "10-11")
+	write(t, filepath.Join(f.root, podSliceRel("A")), cgroup.FileExclusive, "10-11")
+	write(t, filepath.Join(f.root, ctrScopeRel("A", "aaa")), cgroup.FilePartition, "isolated")
+
+	var writes []string
+	cg := cgroup.NewManagerAt(f.root, false, func(path, value string) {
+		rel, _ := filepath.Rel(f.root, path)
+		writes = append(writes, rel+"="+value)
+	})
+	p := New(DefaultConfig(), cg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	if _, err := p.Synchronize(context.Background(), []*api.PodSandbox{pod}, []*api.Container{ctr}); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := f.read(t, ctrScopeRel("A", "aaa"), cgroup.FilePartition); got != "member" {
+		t.Errorf("leaf partition = %q, want member", got)
+	}
+	for _, rel := range []string{kubepods, podSliceRel("A")} {
+		if got := f.read(t, rel, cgroup.FileExclusive); got != "" {
+			t.Errorf("%s exclusive = %q, want it cleared", rel, got)
+		}
+	}
+
+	leaf := filepath.Join(ctrScopeRel("A", "aaa"), cgroup.FilePartition) + "=member"
+	ancestor := filepath.Join(kubepods, cgroup.FileExclusive) + "="
+	if indexOf(writes, leaf) < 0 || indexOf(writes, ancestor) < 0 || indexOf(writes, leaf) > indexOf(writes, ancestor) {
+		t.Errorf("writes %v: want %q before %q", writes, leaf, ancestor)
+	}
+}
+
+// The kernel may already have invalidated a leftover partition; it is
+// released all the same.
+func TestSynchronizeReleasesAnInvalidOrphanPartition(t *testing.T) {
+	f := newFakeTree(t)
+	pod, ctr := f.addContainer("A", "pod", "app", "aaa", "10-11", nil, "Guaranteed")
+	write(t, filepath.Join(f.root, ctrScopeRel("A", "aaa")), cgroup.FilePartition,
+		"isolated invalid (Invalid cpu list in cpuset.cpus.exclusive)")
+
+	p := f.newPlugin(t)
+	if _, err := p.Synchronize(context.Background(), []*api.PodSandbox{pod}, []*api.Container{ctr}); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.read(t, ctrScopeRel("A", "aaa"), cgroup.FilePartition); got != "member" {
+		t.Errorf("leaf partition = %q, want member", got)
+	}
+}
+
+// Releasing an orphan must not disturb a partition that is still wanted.
+func TestSynchronizeKeepsWantedPartitionsNextToAnOrphan(t *testing.T) {
+	f := newFakeTree(t)
+	ann := map[string]string{AnnotationPod: "isolated"}
+	podA, ctrA := f.addContainer("A", "wanted", "app", "aaa", "10-11", ann, "Guaranteed")
+	podB, ctrB := f.addContainer("B", "orphan", "app", "bbb", "20-21", nil, "Guaranteed")
+
+	write(t, filepath.Join(f.root, kubepods), cgroup.FileExclusive, "10-11,20-21")
+	write(t, filepath.Join(f.root, podSliceRel("A")), cgroup.FileExclusive, "10-11")
+	write(t, filepath.Join(f.root, podSliceRel("B")), cgroup.FileExclusive, "20-21")
+	write(t, filepath.Join(f.root, ctrScopeRel("A", "aaa")), cgroup.FilePartition, "isolated")
+	write(t, filepath.Join(f.root, ctrScopeRel("B", "bbb")), cgroup.FilePartition, "isolated")
+
+	p := f.newPlugin(t)
+	if _, err := p.Synchronize(context.Background(),
+		[]*api.PodSandbox{podA, podB}, []*api.Container{ctrA, ctrB}); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := f.read(t, ctrScopeRel("A", "aaa"), cgroup.FilePartition); got != "isolated" {
+		t.Errorf("wanted partition = %q, want isolated", got)
+	}
+	if got := f.read(t, ctrScopeRel("B", "bbb"), cgroup.FilePartition); got != "member" {
+		t.Errorf("orphan partition = %q, want member", got)
+	}
+	if got := f.read(t, kubepods, cgroup.FileExclusive); got != "10-11" {
+		t.Errorf("kubepods.slice exclusive = %q, want only the wanted pod's 10-11", got)
+	}
+	if got := f.read(t, podSliceRel("B"), cgroup.FileExclusive); got != "" {
+		t.Errorf("orphan pod slice exclusive = %q, want it cleared", got)
+	}
+}
+
+func indexOf(list []string, s string) int {
+	for i, v := range list {
+		if v == s {
+			return i
+		}
+	}
+	return -1
+}
+
+// The QoS class is read from the part of the cgroup path below the cgroup
+// root: a root whose own path contains "burstable" (here, as a test's
+// temporary directory could) must not make a Guaranteed pod look Burstable.
+func TestQoSIsReadBelowTheCgroupRoot(t *testing.T) {
+	f := &fakeTree{root: filepath.Join(t.TempDir(), "burstable-lab"), t: t}
+	f.mkcgroup("kubepods.slice", "0-39")
+	p := f.newPlugin(t)
+
+	ann := map[string]string{AnnotationPod: "isolated"}
+	pod, ctr := f.addContainer("A", "pod", "app", "aaa", "10-11", ann, "Guaranteed")
+	if err := p.PostStartContainer(context.Background(), pod, ctr); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := f.read(t, ctrScopeRel("A", "aaa"), cgroup.FilePartition); got != "isolated" {
 		t.Errorf("partition = %q, want isolated", got)
 	}
 }

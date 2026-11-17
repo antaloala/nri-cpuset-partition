@@ -281,3 +281,152 @@ func TestWriteStringReportsACgroupRemovedMidWrite(t *testing.T) {
 		t.Errorf("got %v, want ErrCgroupGone", err)
 	}
 }
+
+func TestFindPartitionRoots(t *testing.T) {
+	root := t.TempDir()
+	kubepods := filepath.Join(root, "kubepods.slice")
+	pod := filepath.Join(kubepods, "kubepods-podX.slice")
+
+	for dir, value := range map[string]string{
+		kubepods: "root\n", // the subtree itself: never reported
+		pod:      "member\n",
+		filepath.Join(pod, "cri-containerd-isolated.scope"): "isolated\n",
+		filepath.Join(pod, "cri-containerd-root.scope"):     "root\n",
+		filepath.Join(pod, "cri-containerd-invalid.scope"):  "isolated invalid (Invalid cpu list in cpuset.cpus.exclusive)\n",
+		filepath.Join(pod, "cri-containerd-member.scope"):   "member\n",
+	} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, FilePartition), []byte(value), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	found, err := testManager(root).FindPartitionRoots(kubepods)
+	if err != nil {
+		t.Fatalf("FindPartitionRoots: %v", err)
+	}
+	want := map[string]bool{
+		filepath.Join(pod, "cri-containerd-isolated.scope"): false,
+		filepath.Join(pod, "cri-containerd-root.scope"):     false,
+		filepath.Join(pod, "cri-containerd-invalid.scope"):  true,
+	}
+	if len(found) != len(want) {
+		t.Fatalf("found %d partitions (%v), want %d", len(found), found, len(want))
+	}
+	for dir, invalid := range want {
+		state, ok := found[dir]
+		if !ok {
+			t.Errorf("%s not found", dir)
+			continue
+		}
+		if state.Invalid != invalid {
+			t.Errorf("%s invalid = %v, want %v", dir, state.Invalid, invalid)
+		}
+	}
+}
+
+// Both scans stay out of the Burstable and BestEffort QoS slices, in the
+// systemd and the cgroupfs layouts: nothing there was set by the plugin.
+func TestScansSkipNonGuaranteedQoSSlices(t *testing.T) {
+	for _, layout := range []struct {
+		name, kubepods, guaranteedPod string
+		qosSlices                     []string
+	}{
+		{
+			name:          "systemd",
+			kubepods:      "kubepods.slice",
+			guaranteedPod: "kubepods-podG.slice",
+			qosSlices: []string{
+				"kubepods-burstable.slice/kubepods-burstable-podB.slice",
+				"kubepods-besteffort.slice/kubepods-besteffort-podE.slice",
+			},
+		},
+		{
+			name:          "cgroupfs",
+			kubepods:      "kubepods",
+			guaranteedPod: "podG",
+			qosSlices:     []string{"burstable/podB", "besteffort/podE"},
+		},
+	} {
+		t.Run(layout.name, func(t *testing.T) {
+			root := t.TempDir()
+			kubepods := filepath.Join(root, layout.kubepods)
+			guaranteed := filepath.Join(kubepods, layout.guaranteedPod, "ctr.scope")
+
+			// The same reservation and partition, once under the Guaranteed
+			// pod and once under each QoS slice.
+			leaves := []string{guaranteed}
+			for _, qos := range layout.qosSlices {
+				leaves = append(leaves, filepath.Join(kubepods, qos, "ctr.scope"))
+			}
+			for _, leaf := range leaves {
+				if err := os.MkdirAll(leaf, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				for file, value := range map[string]string{
+					FileExclusive: "10-11\n",
+					FilePartition: "isolated\n",
+				} {
+					if err := os.WriteFile(filepath.Join(leaf, file), []byte(value), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+
+			m := testManager(root)
+			reservations, err := m.FindExclusiveReservations(kubepods)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := []string{guaranteed}; !reflect.DeepEqual(reservations, want) {
+				t.Errorf("FindExclusiveReservations = %v, want only %v", reservations, want)
+			}
+
+			partitions, err := m.FindPartitionRoots(kubepods)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := partitions[guaranteed]; !ok || len(partitions) != 1 {
+				t.Errorf("FindPartitionRoots = %v, want only %s", partitions, guaranteed)
+			}
+		})
+	}
+}
+
+// The QoS check is made below the pod cgroup tree only: a cgroup root whose
+// own path happens to contain "burstable" must not hide the whole tree.
+func TestScansIgnoreQoSWordsAboveTheSubtree(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "burstable-lab")
+	kubepods := filepath.Join(root, "kubepods.slice")
+	leaf := filepath.Join(kubepods, "kubepods-podG.slice", "ctr.scope")
+	if err := os.MkdirAll(leaf, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(leaf, FilePartition), []byte("isolated\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	partitions, err := testManager(root).FindPartitionRoots(kubepods)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := partitions[leaf]; !ok {
+		t.Errorf("FindPartitionRoots = %v, want %s found", partitions, leaf)
+	}
+}
+
+func TestRelPath(t *testing.T) {
+	m := testManager("/sys/fs/cgroup")
+	for _, tc := range []struct{ in, want string }{
+		{"/sys/fs/cgroup/kubepods.slice/kubepods-podX.slice", "kubepods.slice/kubepods-podX.slice"},
+		{"/sys/fs/cgroup", "."},
+		// Not below the root: returned unchanged.
+		{"/elsewhere/kubepods.slice", "/elsewhere/kubepods.slice"},
+	} {
+		if got := m.RelPath(tc.in); got != tc.want {
+			t.Errorf("RelPath(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

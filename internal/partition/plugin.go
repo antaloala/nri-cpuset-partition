@@ -44,15 +44,34 @@ type Config struct {
 	// default: a plugin restart or upgrade must not disturb running
 	// workloads.
 	CleanupOnExit bool `json:"cleanupOnExit"`
+	// NonAnnotatedPodPartition is the cpuset.cpus.partition value applied to
+	// the containers that get exclusive cpus from the CPU Manager in a pod
+	// carrying no cpuset-partition.nri.io annotation at all. "member", the
+	// default, leaves them alone. It never applies to a pod that has any such
+	// annotation, even one only for other containers.
+	NonAnnotatedPodPartition string `json:"nonAnnotatedPodPartition"`
 }
 
 // DefaultConfig returns the configuration the plugin runs with unless told
 // otherwise.
 func DefaultConfig() Config {
 	return Config{
-		KubepodsCgroup: "kubepods.slice",
-		ResyncPeriod:   10 * time.Second,
-		CleanupOnExit:  false,
+		KubepodsCgroup:           "kubepods.slice",
+		ResyncPeriod:             10 * time.Second,
+		CleanupOnExit:            false,
+		NonAnnotatedPodPartition: cgroup.PartitionMember,
+	}
+}
+
+// Validate rejects a configuration the plugin cannot run with, so that a bad
+// value stops the plugin at startup instead of being silently ignored.
+func (c Config) Validate() error {
+	switch c.NonAnnotatedPodPartition {
+	case cgroup.PartitionMember, cgroup.PartitionRoot, cgroup.PartitionIsolated:
+		return nil
+	default:
+		return fmt.Errorf("invalid partition-value-for-non-annotated-pod %q (want member, root or isolated)",
+			c.NonAnnotatedPodPartition)
 	}
 }
 
@@ -104,13 +123,17 @@ func (p *Plugin) Configure(ctx context.Context, config, runtime, version string)
 		if err := json.Unmarshal([]byte(config), &cfg); err != nil {
 			return 0, fmt.Errorf("invalid plugin configuration: %w", err)
 		}
+		if err := cfg.Validate(); err != nil {
+			return 0, fmt.Errorf("invalid plugin configuration: %w", err)
+		}
 		p.mu.Lock()
 		p.cfg = cfg
 		p.mu.Unlock()
 	}
 
 	p.log.Info("configured", "runtime", runtime, "version", version,
-		"resyncPeriod", p.cfg.ResyncPeriod, "dryRun", p.cg.DryRun())
+		"resyncPeriod", p.cfg.ResyncPeriod, "nonAnnotatedPodPartition", p.cfg.NonAnnotatedPodPartition,
+		"dryRun", p.cg.DryRun())
 
 	return 0, nil
 }
@@ -144,6 +167,7 @@ func (p *Plugin) Synchronize(ctx context.Context, pods []*api.PodSandbox, contai
 	}
 
 	p.adoptStaleReservationsLocked()
+	p.adoptOrphanPartitionsLocked()
 
 	p.log.Info("synchronized", "pods", len(p.pods), "containers", len(containers))
 	p.reconcileLocked(ctx)
@@ -505,7 +529,7 @@ func (p *Plugin) reconcileLocked(ctx context.Context) {
 		}
 		p.applied[id] = t.snapshot()
 		p.log.Info("partition created", "container", t.describe(),
-			"cpus", t.CPUs.String(), "mode", t.Mode, "cgroup", t.Dir)
+			"cpus", t.CPUs.String(), "mode", t.Mode, "modeSource", t.ModeSource, "cgroup", t.Dir)
 	}
 }
 
@@ -611,6 +635,53 @@ func (p *Plugin) adoptStaleReservationsLocked() {
 	}
 	if adopted > 0 {
 		p.log.Info("adopted existing cpu reservations", "count", adopted)
+	}
+}
+
+// orphanKeyPrefix keys, in p.applied, the partitions found by
+// adoptOrphanPartitionsLocked: they have no container id the plugin knows.
+const orphanKeyPrefix = "orphan:"
+
+// adoptOrphanPartitionsLocked finds partitions under the pod cgroup tree that
+// no tracked container wants, typically created by a previous run of the
+// plugin for a container that is still running but no longer in scope, e.g.
+// after a restart with a different --partition-value-for-non-annotated-pod.
+// They are recorded as applied, so that the reconcile demotes them to "member"
+// before it withdraws the ancestors' reservations they depend on.
+//
+// Like adoptStaleReservationsLocked, call it after the containers have been
+// tracked, or every live partition would be taken for an orphan.
+func (p *Plugin) adoptOrphanPartitionsLocked() {
+	subtree := filepath.Join(p.cg.Root(), p.cfg.KubepodsCgroup)
+	if !p.cg.Exists(subtree) {
+		return
+	}
+
+	found, err := p.cg.FindPartitionRoots(subtree)
+	if err != nil {
+		p.log.Warn("cannot scan for orphan partitions", "cgroup", subtree, "err", err)
+		return
+	}
+
+	// Partitions a tracked container wants, or that this process already
+	// manages (on a reconnect, p.applied survives), are not orphans.
+	known := map[string]bool{}
+	for _, ps := range p.pods {
+		for _, t := range ps.managed {
+			known[t.Dir] = true
+		}
+	}
+	for _, a := range p.applied {
+		known[a.Dir] = true
+	}
+
+	for dir, state := range found {
+		if known[dir] {
+			continue
+		}
+		cpus, _ := p.cg.ReadCPUSet(dir, cgroup.FileCPUs) // only used in the log line
+		p.applied[orphanKeyPrefix+dir] = &target{Mode: state.Value, CPUs: cpus, Dir: dir}
+		p.log.Info("found a partition no container wants, releasing it", "cgroup", dir, "state", state.Raw)
 	}
 }
 
